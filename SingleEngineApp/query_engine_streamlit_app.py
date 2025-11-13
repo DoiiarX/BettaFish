@@ -30,6 +30,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from QueryEngine import DeepSearchAgent, Settings
 from config import settings
 from utils.github_issues import error_with_issue_link
+from utils.context_cache import ContextCache
+
+try:
+    from context_display import render_structured_context_tab
+except ModuleNotFoundError:  # pragma: no cover - fallback for package imports
+    from SingleEngineApp.context_display import render_structured_context_tab  # type: ignore
+
+
+context_cache = ContextCache()
 
 
 def main():
@@ -189,7 +198,7 @@ def display_results(agent: DeepSearchAgent, final_report: str):
     st.header("研究结果")
 
     # 结果标签页（已移除下载选项）
-    tab1, tab2 = st.tabs(["研究小结", "引用信息"])
+    tab1, tab2, tab3 = st.tabs(["研究小结", "引用信息", "结构化上下文"])
 
     with tab1:
         st.markdown(final_report)
@@ -221,6 +230,12 @@ def display_results(agent: DeepSearchAgent, final_report: str):
                              search.content[:200] + "..." if len(search.content) > 200 else search.content)
                     if search.score:
                         st.write("**相关度评分:**", search.score)
+
+    with tab3:
+        render_structured_context_tab(getattr(agent.state, "structured_context", {}))
+
+    if getattr(agent.state, "query", None):
+        context_cache.save(agent.state.query, getattr(agent.state, "structured_context", {}))
 
 
 if __name__ == "__main__":

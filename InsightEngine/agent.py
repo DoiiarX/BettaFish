@@ -19,10 +19,11 @@ from .nodes import (
     ReflectionSummaryNode,
     ReportFormattingNode
 )
-from .state import State
+from .state import State, Paragraph
 from .tools import MediaCrawlerDB, DBResponse, keyword_optimizer, multilingual_sentiment_analyzer
 from .utils.config import settings, Settings
 from .utils import format_search_results_for_prompt
+from utils.contextualizer import StructuredContextBuilder
 
 
 class DeepSearchAgent:
@@ -52,6 +53,8 @@ class DeepSearchAgent:
         
         # 状态
         self.state = State()
+        self.context_builder = StructuredContextBuilder(agent_name="Insight")
+        self.state.update_structured_context(self.context_builder.empty_context())
         
         # 确保输出目录存在
         os.makedirs(self.config.OUTPUT_DIR, exist_ok=True)
@@ -415,6 +418,7 @@ class DeepSearchAgent:
         
         # 生成结构并更新状态
         self.state = report_structure_node.mutate_state(state=self.state)
+        self.state.query = query
         
         _message = f"报告结构已生成，共 {len(self.state.paragraphs)} 个段落:"
         for i, paragraph in enumerate(self.state.paragraphs, 1):
@@ -548,6 +552,10 @@ class DeepSearchAgent:
             logger.info(_message)
         else:
             logger.info("  - 未找到搜索结果")
+
+        search_results = self._attach_structured_context(
+            paragraph, search_results, search_query, stage="initial"
+        )
         
         # 更新状态中的搜索历史
         paragraph.research.add_search_results(search_query, search_results)
@@ -682,6 +690,13 @@ class DeepSearchAgent:
             else:
                 logger.info("    未找到反思搜索结果")
             
+            search_results = self._attach_structured_context(
+                paragraph,
+                search_results,
+                search_query,
+                stage=f"reflection_{reflection_i + 1}",
+            )
+            
             # 更新搜索历史
             paragraph.research.add_search_results(search_query, search_results)
             
@@ -702,6 +717,26 @@ class DeepSearchAgent:
             )
             
             logger.info(f"    反思 {reflection_i + 1} 完成")
+
+    def _attach_structured_context(
+        self,
+        paragraph: Paragraph,
+        search_results: List[Dict[str, Any]],
+        search_query: str,
+        stage: str,
+    ) -> List[Dict[str, Any]]:
+        """构建结构化上下文并增强搜索内容"""
+        if not search_results:
+            return search_results
+        decorated, context = self.context_builder.enrich_with_search_results(
+            search_results=search_results,
+            query=search_query,
+            paragraph_title=paragraph.title,
+            stage=stage,
+            existing_context=getattr(self.state, "structured_context", None),
+        )
+        self.state.update_structured_context(context)
+        return decorated
     
     def _generate_final_report(self) -> str:
         """生成最终报告"""

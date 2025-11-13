@@ -147,6 +147,7 @@ class State:
     paragraphs: List[Paragraph] = field(default_factory=list)     # 段落列表
     final_report: str = ""                                         # 最终报告内容
     is_completed: bool = False                                     # 是否完成
+    structured_context: Dict[str, Any] = field(default_factory=dict)  # 结构化上下文
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
     
@@ -193,6 +194,11 @@ class State:
     def update_timestamp(self):
         """更新时间戳"""
         self.updated_at = datetime.now().isoformat()
+
+    def update_structured_context(self, context: Dict[str, Any]):
+        """更新结构化上下文"""
+        self.structured_context = context or {}
+        self.update_timestamp()
     
     def get_progress_summary(self) -> Dict[str, Any]:
         """获取进度摘要"""
