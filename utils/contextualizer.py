@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from loguru import logger
+
 # --- Lightweight semantic prototypes ---------------------------------------------------------
 
 DEFAULT_PROTOTYPES: Dict[str, List[str]] = {
@@ -303,10 +305,14 @@ class StructuredContextBuilder:
         agent_name: str = "generic",
         labeler: Optional[SemanticPrototypeLabeler] = None,
         max_tokens_per_event: int = 8,
+        keyword_labeler: Optional[Any] = None,
+        keyword_labeler_max_snippets: int = 3,
     ):
         self.agent_name = agent_name
         self.labeler = labeler or SemanticPrototypeLabeler()
         self.max_tokens_per_event = max_tokens_per_event
+        self.keyword_labeler = keyword_labeler
+        self.keyword_labeler_max_snippets = keyword_labeler_max_snippets
 
     # Public API ---------------------------------------------------------------------------
 
@@ -418,7 +424,18 @@ class StructuredContextBuilder:
         self, text_blob: str, source_url: str, timestamp: str
     ) -> List[Dict[str, Any]]:
         annotations: List[Dict[str, Any]] = []
+        seen_terms = set()
+
+        for annotation in self._keyword_labeler_annotations(
+            text_blob, source_url, timestamp
+        ):
+            annotations.append(annotation)
+            seen_terms.add(annotation["text"].lower())
+
         for token in self.labeler.tokenize(text_blob)[: self.max_tokens_per_event]:
+            token_lower = token.lower()
+            if token_lower in seen_terms:
+                continue
             context_snippet = self._context_snippet(text_blob, token)
             labels = [label.to_dict() for label in self.labeler.label_token(token, context_snippet)]
             annotations.append(
@@ -430,7 +447,69 @@ class StructuredContextBuilder:
                     "timestamp": timestamp,
                 }
             )
+            seen_terms.add(token_lower)
         return annotations
+
+    def _keyword_labeler_annotations(
+        self, text_blob: str, source_url: str, timestamp: str
+    ) -> List[Dict[str, Any]]:
+        if not self.keyword_labeler:
+            return []
+        snippets = self._slice_text_for_labeler(text_blob)
+        annotations: List[Dict[str, Any]] = []
+        for snippet in snippets:
+            try:
+                suggestions = self.keyword_labeler.label_terms(
+                    snippet,
+                    topic=self.agent_name,
+                    max_terms=self.max_tokens_per_event,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"关键词标签器调用失败: {exc}")
+                break
+
+            for item in suggestions or []:
+                term = item.get("term") or item.get("text")
+                if not term:
+                    continue
+                labels = item.get("labels") or []
+                normalized = []
+                for label in labels:
+                    name = label.get("label") or label.get("name")
+                    if not name:
+                        continue
+                    score = float(label.get("score") or label.get("confidence") or 0.5)
+                    normalized.append(
+                        {"label": name, "score": max(0.0, min(1.0, score))}
+                    )
+                if not normalized:
+                    normalized.append({"label": "other", "score": 0.5})
+                annotations.append(
+                    {
+                        "text": term.strip(),
+                        "context": snippet[:200],
+                        "labels": normalized,
+                        "source": source_url,
+                        "timestamp": timestamp,
+                    }
+                )
+        return annotations
+
+    def _slice_text_for_labeler(self, text_blob: str) -> List[str]:
+        if not text_blob:
+            return []
+        import re
+
+        raw_sentences = re.split(r'(?<=[。！？!?])\s+|\n+', text_blob)
+        sentences = [
+            sentence.strip()
+            for sentence in raw_sentences
+            if len(sentence.strip()) >= 4
+        ]
+        selected = sentences[: self.keyword_labeler_max_snippets]
+        if not selected:
+            selected = [text_blob[:240]]
+        return [sentence[:400] for sentence in selected]
 
     def _aggregate_labels(self, tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         scores: Dict[str, float] = {}

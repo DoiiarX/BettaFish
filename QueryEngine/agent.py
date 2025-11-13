@@ -22,6 +22,7 @@ from .state import State, Paragraph
 from .tools import TavilyNewsAgency, TavilyResponse
 from .utils import Settings, format_search_results_for_prompt
 from utils.contextualizer import StructuredContextBuilder
+from utils.keyword_labeler import get_keyword_labeler
 from loguru import logger
 
 class DeepSearchAgent:
@@ -49,7 +50,10 @@ class DeepSearchAgent:
         
         # 状态
         self.state = State()
-        self.context_builder = StructuredContextBuilder(agent_name="Query")
+        self.context_builder = StructuredContextBuilder(
+            agent_name="Query",
+            keyword_labeler=get_keyword_labeler(),
+        )
         self.state.update_structured_context(self.context_builder.empty_context())
         
         # 确保输出目录存在

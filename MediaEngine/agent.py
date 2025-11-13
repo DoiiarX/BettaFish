@@ -21,6 +21,7 @@ from .nodes import (
 from .state import State, Paragraph
 from .tools import BochaMultimodalSearch, BochaResponse
 from .utils import settings, Settings, format_search_results_for_prompt
+from utils.keyword_labeler import get_keyword_labeler
 from utils.contextualizer import StructuredContextBuilder
 
 
@@ -47,7 +48,10 @@ class DeepSearchAgent:
         
         # 状态
         self.state = State()
-        self.context_builder = StructuredContextBuilder(agent_name="Media")
+        self.context_builder = StructuredContextBuilder(
+            agent_name="Media",
+            keyword_labeler=get_keyword_labeler(),
+        )
         self.state.update_structured_context(self.context_builder.empty_context())
         
         # 确保输出目录存在

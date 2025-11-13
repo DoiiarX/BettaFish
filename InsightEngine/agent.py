@@ -24,6 +24,7 @@ from .tools import MediaCrawlerDB, DBResponse, keyword_optimizer, multilingual_s
 from .utils.config import settings, Settings
 from .utils import format_search_results_for_prompt
 from utils.contextualizer import StructuredContextBuilder
+from utils.keyword_labeler import get_keyword_labeler
 
 
 class DeepSearchAgent:
@@ -53,7 +54,10 @@ class DeepSearchAgent:
         
         # 状态
         self.state = State()
-        self.context_builder = StructuredContextBuilder(agent_name="Insight")
+        self.context_builder = StructuredContextBuilder(
+            agent_name="Insight",
+            keyword_labeler=get_keyword_labeler(),
+        )
         self.state.update_structured_context(self.context_builder.empty_context())
         
         # 确保输出目录存在
