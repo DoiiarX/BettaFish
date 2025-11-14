@@ -403,6 +403,22 @@ class DeepSearchAgent:
             origin_query=self.state.query,
             existing_context=getattr(self.state, "structured_context", None),
         )
+        kept_event_ids = self.context_builder.apply_weight_compaction(
+            context,
+            stage,
+            [item.get("structured_event_id") for item in decorated if item.get("structured_event_id")],
+        )
+        if kept_event_ids:
+            original_count = len(decorated)
+            decorated = [
+                item
+                for item in decorated
+                if item.get("structured_event_id") in kept_event_ids
+            ]
+            if len(decorated) < original_count:
+                logger.info(
+                    f"    阶段 {stage} 根据权重保留 {len(decorated)}/{original_count} 条关键信息"
+                )
         self.state.update_structured_context(context)
         return decorated
     

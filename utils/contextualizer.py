@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+import statistics
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from loguru import logger
 
@@ -395,12 +396,24 @@ class StructuredContextBuilder:
         max_tokens_per_event: int = 8,
         keyword_labeler: Optional[Any] = None,
         keyword_labeler_max_snippets: int = 3,
+        adaptive_pruning: bool = True,
+        min_events_per_stage: int = 2,
+        max_events_per_stage: int = 15,
+        stage_retention_defaults: Optional[Dict[str, float]] = None,
     ):
         self.agent_name = agent_name
         self.labeler = labeler or SemanticPrototypeLabeler()
         self.max_tokens_per_event = max_tokens_per_event
         self.keyword_labeler = keyword_labeler
         self.keyword_labeler_max_snippets = keyword_labeler_max_snippets
+        self.adaptive_pruning = adaptive_pruning
+        self.min_events_per_stage = max(1, min_events_per_stage)
+        self.max_events_per_stage = max(self.min_events_per_stage, max_events_per_stage)
+        self.stage_retention_defaults = stage_retention_defaults or {
+            "initial": 0.65,
+            "reflection": 0.45,
+            "default": 0.55,
+        }
 
     # Public API ---------------------------------------------------------------------------
 
@@ -417,6 +430,8 @@ class StructuredContextBuilder:
                 "origin_query": None,
                 "origin_labels": [],
                 "origin_dominant_labels": [],
+                "suppressed_events": [],
+                "weight_retention_profile": {},
             },
         }
 
@@ -457,10 +472,7 @@ class StructuredContextBuilder:
             self._update_origin_relation(context, event, relations_index)
             decorated_results.append(self._decorate_result(result, event))
 
-        context["timeline"] = sorted(
-            context["events"].values(),
-            key=lambda ev: ev.get("timestamp") or "",
-        )
+        self._refresh_views(context)
         context["metadata"].update(
             {
                 "last_query": query,
@@ -481,6 +493,19 @@ class StructuredContextBuilder:
         """
         context = existing_context or self.empty_context()
         return self._ensure_origin_node(origin_query, context)
+
+    def apply_weight_compaction(
+        self,
+        context: Dict[str, Any],
+        stage: str,
+        candidate_event_ids: Optional[Sequence[str]] = None,
+    ) -> Optional[Set[str]]:
+        """
+        根据当前阶段的权重分布动态裁剪事件，返回保留的事件ID集合。
+        """
+        if not self.adaptive_pruning:
+            return None
+        return self._prune_stage_events(context, stage, candidate_event_ids)
 
     # Internal helpers --------------------------------------------------------------------
 
@@ -521,6 +546,135 @@ class StructuredContextBuilder:
         )
         self._update_token_statistics(context, origin_event)
         return context
+
+    def _prune_stage_events(
+        self,
+        context: Dict[str, Any],
+        stage: str,
+        candidate_event_ids: Optional[Sequence[str]] = None,
+    ) -> Optional[Set[str]]:
+        events = context.get("events", {})
+        stage_key = self._stage_key(stage)
+        active_events = [
+            event
+            for event in events.values()
+            if not event.get("is_origin")
+            and self._stage_key(event.get("stage")) == stage_key
+        ]
+        if len(active_events) <= self.min_events_per_stage:
+            return None
+
+        retention_ratio = self._stage_retention_ratio(stage_key)
+        keep_count = max(
+            self.min_events_per_stage,
+            int(round(len(active_events) * retention_ratio)),
+        )
+        keep_count = min(len(active_events), keep_count, self.max_events_per_stage)
+        if keep_count >= len(active_events):
+            return None
+
+        ranked_events = sorted(
+            active_events,
+            key=lambda ev: ev.get("weight", ev.get("intrinsic_weight", 0.0)),
+            reverse=True,
+        )
+        weights = [ev.get("weight", 0.0) for ev in ranked_events]
+        percentile_index = max(0, min(len(weights) - 1, keep_count - 1))
+        percentile_weight = weights[percentile_index]
+        median_weight = statistics.median(weights)
+        adaptive_cutoff = max(percentile_weight, median_weight * 0.85)
+
+        keep_ids = {
+            ev["event_id"]
+            for ev in ranked_events[:keep_count]
+        }
+        keep_ids.update(
+            ev["event_id"]
+            for ev in ranked_events
+            if ev.get("weight", 0.0) >= adaptive_cutoff
+        )
+
+        newly_suppressed = []
+        changed = False
+        for event in active_events:
+            previous_state = event.get("suppressed", False)
+            suppressed = event["event_id"] not in keep_ids
+            event["suppressed"] = suppressed
+            if suppressed != previous_state:
+                changed = True
+            if suppressed and not previous_state:
+                newly_suppressed.append(
+                    {
+                        "event_id": event["event_id"],
+                        "stage": stage_key,
+                        "weight": round(event.get("weight", 0.0), 3),
+                        "cutoff": round(adaptive_cutoff, 3),
+                    }
+                )
+
+        if newly_suppressed:
+            metadata = context.setdefault("metadata", {})
+            metadata.setdefault("suppressed_events", []).extend(newly_suppressed)
+            metadata.setdefault("weight_retention_profile", {}).update(
+                {
+                    stage_key: {
+                        "total": len(active_events),
+                        "kept": len(keep_ids),
+                        "cutoff": round(adaptive_cutoff, 3),
+                    }
+                }
+            )
+
+        if changed:
+            self._refresh_views(context)
+
+        if candidate_event_ids:
+            candidate_set = {event_id for event_id in candidate_event_ids if event_id}
+            if candidate_set:
+                return keep_ids.intersection(candidate_set)
+        return keep_ids
+
+    def _refresh_views(self, context: Dict[str, Any]) -> None:
+        events = context.get("events", {})
+        context["timeline"] = sorted(
+            [
+                event
+                for event in events.values()
+                if not event.get("suppressed")
+            ],
+            key=lambda ev: ev.get("timestamp") or "",
+        )
+        context["token_statistics"] = {}
+        for event in context["timeline"]:
+            self._update_token_statistics(context, event)
+        context["relations"] = [
+            relation
+            for relation in context.get("relations", [])
+            if not self._is_suppressed(events, relation.get("source_event"))
+            and not self._is_suppressed(events, relation.get("target_event"))
+        ]
+
+    def _stage_retention_ratio(self, stage_key: str) -> float:
+        base = self.stage_retention_defaults.get(
+            stage_key, self.stage_retention_defaults.get("default", 0.55)
+        )
+        return max(0.2, min(0.95, base))
+
+    @staticmethod
+    def _stage_key(stage: Optional[str]) -> str:
+        if not stage:
+            return "default"
+        stage_lower = stage.lower()
+        if stage_lower.startswith("reflection"):
+            return "reflection"
+        return stage_lower
+
+    @staticmethod
+    def _is_suppressed(events: Dict[str, Any], event_id: Optional[str]) -> bool:
+        if not event_id:
+            return False
+        event = events.get(event_id)
+        return bool(event and event.get("suppressed"))
 
     def _build_event(
         self,
@@ -566,6 +720,8 @@ class StructuredContextBuilder:
             "label_distribution": label_distribution,
             "top_labels": label_distribution[:3],
             "dominant_labels": dominant,
+            "suppressed": False,
+            "is_origin": False,
         }
 
     def _build_origin_event(self, origin_query: str) -> Dict[str, Any]:
@@ -594,6 +750,8 @@ class StructuredContextBuilder:
             "dominant_labels": dominant,
             "origin_similarity": 1.0,
             "origin_shared_labels": dominant,
+            "suppressed": False,
+            "is_origin": True,
         }
 
     def _token_annotations(
@@ -781,11 +939,13 @@ class StructuredContextBuilder:
         event: Dict[str, Any],
         relation_index: set,
     ) -> None:
-        if not event.get("dominant_labels"):
+        if not event.get("dominant_labels") or event.get("suppressed"):
             return
         events = context.get("events", {})
         for other_id, other in events.items():
             if other_id == event["event_id"]:
+                continue
+            if other.get("suppressed"):
                 continue
             shared = set(event["dominant_labels"]).intersection(
                 other.get("dominant_labels", [])
@@ -810,6 +970,8 @@ class StructuredContextBuilder:
         event: Dict[str, Any],
         relation_index: set,
     ) -> None:
+        if event.get("suppressed"):
+            return
         metadata = context.get("metadata", {})
         origin_id = metadata.get("origin_event_id")
         if not origin_id or origin_id == event["event_id"]:
