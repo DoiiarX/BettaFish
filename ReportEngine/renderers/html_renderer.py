@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import html
 import json
 from typing import Any, Dict, List
@@ -19,6 +20,31 @@ class HTMLRenderer:
     - 提供主题变量、编号映射等辅助功能。
     """
 
+    CALLOUT_ALLOWED_TYPES = {
+        "paragraph",
+        "list",
+        "table",
+        "blockquote",
+        "code",
+        "math",
+        "figure",
+        "kpiGrid",
+    }
+    INLINE_ARTIFACT_KEYS = {
+        "props",
+        "widgetId",
+        "widgetType",
+        "data",
+        "dataRef",
+        "datasets",
+        "labels",
+        "config",
+        "options",
+    }
+    TABLE_COMPLEX_CHARS = set(
+        "@％%（）()，,。；;：:、？?！!·…-—_+<>[]{}|\\/\"'`~$^&*#"
+    )
+
     def __init__(self, config: Dict[str, Any] | None = None):
         """初始化渲染器缓存并允许注入额外配置（如主题覆盖）"""
         self.config = config or {}
@@ -28,6 +54,7 @@ class HTMLRenderer:
         self.toc_entries: List[Dict[str, Any]] = []
         self.heading_counter = 0
         self.metadata: Dict[str, Any] = {}
+        self.chapters: List[Dict[str, Any]] = []
         self.chapter_anchor_map: Dict[str, str] = {}
         self.heading_label_map: Dict[str, Dict[str, Any]] = {}
         self.primary_heading_index = 0
@@ -36,21 +63,29 @@ class HTMLRenderer:
     # ====== 公共入口 ======
 
     def render(self, document_ir: Dict[str, Any]) -> str:
-        """接收Document IR，重置内部状态并输出完整HTML"""
+        """
+        接收Document IR，重置内部状态并输出完整HTML。
+
+        参数:
+            document_ir: 由 DocumentComposer 生成的整本报告数据。
+
+        返回:
+            str: 可直接写入磁盘的完整HTML文档。
+        """
         self.document = document_ir or {}
         self.widget_scripts = []
         self.chart_counter = 0
         self.heading_counter = 0
         self.metadata = self.document.get("metadata", {}) or {}
+        raw_chapters = self.document.get("chapters", []) or []
+        self.chapters = self._prepare_chapters(raw_chapters)
         self.chapter_anchor_map = {
             chapter.get("chapterId"): chapter.get("anchor")
-            for chapter in self.document.get("chapters", [])
+            for chapter in self.chapters
             if chapter.get("chapterId") and chapter.get("anchor")
         }
-        self.heading_label_map = self._compute_heading_labels(self.document.get("chapters", []))
-        self.toc_entries = self._collect_toc_entries(
-            self.document.get("chapters", [])
-        )
+        self.heading_label_map = self._compute_heading_labels(self.chapters)
+        self.toc_entries = self._collect_toc_entries(self.chapters)
 
         metadata = self.metadata
         theme_tokens = metadata.get("themeTokens") or self.document.get("themeTokens", {})
@@ -62,8 +97,50 @@ class HTMLRenderer:
 
     # ====== Head / Body ======
 
+    def _resolve_color_value(self, value: Any, fallback: str) -> str:
+        """从颜色token中提取字符串值"""
+        if isinstance(value, str):
+            value = value.strip()
+            return value or fallback
+        if isinstance(value, dict):
+            for key in ("main", "value", "color", "base", "default"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+            for candidate in value.values():
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+        return fallback
+
+    def _resolve_color_family(self, value: Any, fallback: Dict[str, str]) -> Dict[str, str]:
+        """解析主/亮/暗三色，缺失时回落到默认值"""
+        result = {
+            "main": fallback.get("main", "#007bff"),
+            "light": fallback.get("light", fallback.get("main", "#007bff")),
+            "dark": fallback.get("dark", fallback.get("main", "#007bff")),
+        }
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                result["main"] = stripped
+            return result
+        if isinstance(value, dict):
+            result["main"] = self._resolve_color_value(value.get("main") or value, result["main"])
+            result["light"] = self._resolve_color_value(value.get("light") or value.get("lighter"), result["light"])
+            result["dark"] = self._resolve_color_value(value.get("dark") or value.get("darker"), result["dark"])
+        return result
+
     def _render_head(self, title: str, theme_tokens: Dict[str, Any]) -> str:
-        """渲染<head>部分，加载主题CSS与必要的脚本依赖"""
+        """
+        渲染<head>部分，加载主题CSS与必要的脚本依赖。
+
+        参数:
+            title: 页面title标签内容。
+            theme_tokens: 主题变量，用于注入CSS。
+
+        返回:
+            str: head片段HTML。
+        """
         css = self._build_css(theme_tokens)
         return f"""
 <head>
@@ -72,6 +149,7 @@ class HTMLRenderer:
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{self._escape_html(title)}</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-sankey@4"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <script>
@@ -97,15 +175,17 @@ class HTMLRenderer:
 </head>""".strip()
 
     def _render_body(self) -> str:
-        """拼装<body>结构，包含头部、导航、章节和脚本"""
+        """
+        拼装<body>结构，包含头部、导航、章节和脚本。
+
+        返回:
+            str: body片段HTML。
+        """
         header = self._render_header()
         cover = self._render_cover()
         hero = self._render_hero()
         toc_section = self._render_toc_section()
-        chapters = "".join(
-            self._render_chapter(chapter)
-            for chapter in self.document.get("chapters", [])
-        )
+        chapters = "".join(self._render_chapter(chapter) for chapter in self.chapters)
         widget_scripts = "\n".join(self.widget_scripts)
         hydration = self._hydration_script()
 
@@ -125,7 +205,12 @@ class HTMLRenderer:
     # ====== Header / Meta / TOC ======
 
     def _render_header(self) -> str:
-        """渲染吸顶头部，包含标题、副标题与功能按钮"""
+        """
+        渲染吸顶头部，包含标题、副标题与功能按钮。
+
+        返回:
+            str: header HTML。
+        """
         metadata = self.metadata
         title = metadata.get("title") or "智能舆情分析报告"
         subtitle = metadata.get("subtitle") or metadata.get("templateName") or "自动生成"
@@ -145,14 +230,24 @@ class HTMLRenderer:
 """.strip()
 
     def _render_tagline(self) -> str:
-        """渲染标题下方的标语，如无标语则返回空字符串"""
+        """
+        渲染标题下方的标语，如无标语则返回空字符串。
+
+        返回:
+            str: tagline HTML或空串。
+        """
         tagline = self.metadata.get("tagline")
         if not tagline:
             return ""
         return f'<p class="tagline">{self._escape_html(tagline)}</p>'
 
     def _render_cover(self) -> str:
-        """文章开头的封面区，居中展示标题与“文章总览”提示"""
+        """
+        文章开头的封面区，居中展示标题与“文章总览”提示。
+
+        返回:
+            str: cover section HTML。
+        """
         title = self.metadata.get("title") or "智能舆情报告"
         subtitle = self.metadata.get("subtitle") or self.metadata.get("templateName") or ""
         overview_hint = "文章总览"
@@ -165,7 +260,12 @@ class HTMLRenderer:
 """.strip()
 
     def _render_hero(self) -> str:
-        """根据layout中的hero字段输出摘要/KPI/亮点区"""
+        """
+        根据layout中的hero字段输出摘要/KPI/亮点区。
+
+        返回:
+            str: hero区HTML，若无数据则为空字符串。
+        """
         hero = self.metadata.get("hero") or {}
         if not hero:
             return ""
@@ -212,7 +312,12 @@ class HTMLRenderer:
         return ""
 
     def _render_toc_section(self) -> str:
-        """生成目录模块，如无目录数据则返回空字符串"""
+        """
+        生成目录模块，如无目录数据则返回空字符串。
+
+        返回:
+            str: toc HTML结构。
+        """
         if not self.toc_entries:
             return ""
         toc_config = self.metadata.get("toc") or {}
@@ -231,7 +336,15 @@ class HTMLRenderer:
 """.strip()
 
     def _collect_toc_entries(self, chapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """根据metadata中的tocPlan或章节heading收集目录项"""
+        """
+        根据metadata中的tocPlan或章节heading收集目录项。
+
+        参数:
+            chapters: Document IR中的章节数组。
+
+        返回:
+            list[dict]: 规范化后的目录条目，包含level/text/anchor。
+        """
         metadata = self.metadata
         toc_config = metadata.get("toc") or {}
         custom_entries = toc_config.get("customEntries")
@@ -268,8 +381,155 @@ class HTMLRenderer:
                     )
         return entries
 
+    def _prepare_chapters(self, chapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """复制章节并展开其中序列化的block，避免渲染缺失"""
+        prepared: List[Dict[str, Any]] = []
+        for chapter in chapters or []:
+            chapter_copy = copy.deepcopy(chapter)
+            chapter_copy["blocks"] = self._expand_blocks_in_place(chapter_copy.get("blocks", []))
+            prepared.append(chapter_copy)
+        return prepared
+
+    def _expand_blocks_in_place(self, blocks: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
+        """遍历block列表，将内嵌JSON串拆解为独立block"""
+        expanded: List[Dict[str, Any]] = []
+        for block in blocks or []:
+            extras = self._extract_embedded_blocks(block)
+            expanded.append(block)
+            if extras:
+                expanded.extend(self._expand_blocks_in_place(extras))
+        return expanded
+
+    def _extract_embedded_blocks(self, block: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        在block内部查找被误写成字符串的block列表，并返回补充的block
+        """
+        extracted: List[Dict[str, Any]] = []
+
+        def traverse(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in list(node.items()):
+                    if key == "text" and isinstance(value, str):
+                        decoded = self._decode_embedded_block_payload(value)
+                        if decoded:
+                            node[key] = ""
+                            extracted.extend(decoded)
+                        continue
+                    traverse(value)
+            elif isinstance(node, list):
+                for item in node:
+                    traverse(item)
+
+        traverse(block)
+        return extracted
+
+    def _decode_embedded_block_payload(self, raw: str) -> List[Dict[str, Any]] | None:
+        """
+        将字符串形式的block描述恢复为结构化列表。
+        """
+        if not isinstance(raw, str):
+            return None
+        stripped = raw.strip()
+        if not stripped or stripped[0] not in "{[":
+            return None
+        payload: Any | None = None
+        decode_targets = [stripped]
+        if stripped and stripped[0] != "[":
+            decode_targets.append(f"[{stripped}]")
+        for candidate in decode_targets:
+            try:
+                payload = json.loads(candidate)
+                break
+            except json.JSONDecodeError:
+                continue
+        if payload is None:
+            for candidate in decode_targets:
+                try:
+                    payload = ast.literal_eval(candidate)
+                    break
+                except (ValueError, SyntaxError):
+                    continue
+        if payload is None:
+            return None
+
+        blocks = self._collect_blocks_from_payload(payload)
+        return blocks or None
+
+    @staticmethod
+    def _looks_like_block(payload: Dict[str, Any]) -> bool:
+        """粗略判断dict是否符合block结构"""
+        if not isinstance(payload, dict):
+            return False
+        if "type" in payload and isinstance(payload["type"], str):
+            return True
+        structural_keys = {"blocks", "rows", "items", "widgetId", "widgetType", "data"}
+        return any(key in payload for key in structural_keys)
+
+    def _collect_blocks_from_payload(self, payload: Any) -> List[Dict[str, Any]]:
+        """递归收集payload中的block节点"""
+        collected: List[Dict[str, Any]] = []
+        if isinstance(payload, dict):
+            block_list = payload.get("blocks")
+            block_type = payload.get("type")
+            if isinstance(block_list, list) and not block_type:
+                for candidate in block_list:
+                    collected.extend(self._collect_blocks_from_payload(candidate))
+                return collected
+            if payload.get("cells") and not block_type:
+                for cell in payload["cells"]:
+                    collected.extend(self._collect_blocks_from_payload(cell.get("blocks")))
+                return collected
+            if payload.get("items") and not block_type:
+                for item in payload["items"]:
+                    collected.extend(self._collect_blocks_from_payload(item))
+                return collected
+            appended = False
+            if block_type or payload.get("widgetId") or payload.get("rows"):
+                coerced = self._coerce_block_dict(payload)
+                if coerced:
+                    collected.append(coerced)
+                    appended = True
+            items = payload.get("items")
+            if isinstance(items, list) and not block_type:
+                for item in items:
+                    collected.extend(self._collect_blocks_from_payload(item))
+                return collected
+            if appended:
+                return collected
+        elif isinstance(payload, list):
+            for item in payload:
+                collected.extend(self._collect_blocks_from_payload(item))
+        elif payload is None:
+            return collected
+        return collected
+
+    def _coerce_block_dict(self, payload: Any) -> Dict[str, Any] | None:
+        """尝试将dict补充为合法block结构"""
+        if not isinstance(payload, dict):
+            return None
+        block = copy.deepcopy(payload)
+        block_type = block.get("type")
+        if not block_type:
+            if "widgetId" in block:
+                block_type = block["type"] = "widget"
+            elif "rows" in block or "cells" in block:
+                block_type = block["type"] = "table"
+                if "rows" not in block and isinstance(block.get("cells"), list):
+                    block["rows"] = [{"cells": block.pop("cells")}]
+            elif "items" in block:
+                block_type = block["type"] = "list"
+        return block if block.get("type") else None
+
     def _format_toc_entry(self, entry: Dict[str, Any]) -> str:
-        """将单个目录项转为带描述的HTML行"""
+        """
+        将单个目录项转为带描述的HTML行。
+
+        参数:
+            entry: 目录条目，需包含 `text` 与 `anchor`。
+
+        返回:
+            str: `<li>` 形式的HTML。
+        """
         desc = entry.get("description")
         desc_html = f'<p class="toc-desc">{self._escape_html(desc)}</p>' if desc else ""
         level = entry.get("level", 2)
@@ -277,7 +537,15 @@ class HTMLRenderer:
         return f'<li class="level-{css_level}"><a href="#{self._escape_attr(entry["anchor"])}">{self._escape_html(entry["text"])}</a>{desc_html}</li>'
 
     def _compute_heading_labels(self, chapters: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """预计算各级标题的编号（章：一、二；节：1.1；小节：1.1.1）"""
+        """
+        预计算各级标题的编号（章：一、二；节：1.1；小节：1.1.1）。
+
+        参数:
+            chapters: Document IR中的章节数组。
+
+        返回:
+            dict: 锚点到编号/描述的映射，方便TOC与正文引用。
+        """
         label_map: Dict[str, Dict[str, Any]] = {}
 
         for chap_idx, chapter in enumerate(chapters or [], start=1):
@@ -367,17 +635,41 @@ class HTMLRenderer:
     # ====== 章节 & Block 渲染 ======
 
     def _render_chapter(self, chapter: Dict[str, Any]) -> str:
-        """将章节blocks包裹进<section>，便于CSS控制"""
+        """
+        将章节blocks包裹进<section>，便于CSS控制。
+
+        参数:
+            chapter: 单个章节JSON。
+
+        返回:
+            str: section包裹的HTML。
+        """
         section_id = self._escape_attr(chapter.get("anchor") or f"chapter-{chapter.get('chapterId', 'x')}")
         blocks_html = self._render_blocks(chapter.get("blocks", []))
         return f'<section id="{section_id}" class="chapter">\n{blocks_html}\n</section>'
 
     def _render_blocks(self, blocks: List[Dict[str, Any]]) -> str:
-        """顺序渲染章节内所有block"""
+        """
+        顺序渲染章节内所有block。
+
+        参数:
+            blocks: 章节内部的block数组。
+
+        返回:
+            str: 拼接后的HTML。
+        """
         return "".join(self._render_block(block) for block in blocks or [])
 
     def _render_block(self, block: Dict[str, Any]) -> str:
-        """根据block.type分派到不同的渲染函数"""
+        """
+        根据block.type分派到不同的渲染函数。
+
+        参数:
+            block: 单个block对象。
+
+        返回:
+            str: 渲染后的HTML，未知类型会输出JSON调试信息。
+        """
         block_type = block.get("type")
         handlers = {
             "heading": self._render_heading,
@@ -397,6 +689,8 @@ class HTMLRenderer:
         handler = handlers.get(block_type)
         if handler:
             return handler(block)
+        if isinstance(block.get("blocks"), list):
+            return self._render_blocks(block["blocks"])
         return f'<pre class="unknown-block">{self._escape_html(json.dumps(block, ensure_ascii=False, indent=2))}</pre>'
 
     def _render_heading(self, block: Dict[str, Any]) -> str:
@@ -441,9 +735,18 @@ class HTMLRenderer:
         return f'<{tag}{class_attr}>{items_html}</{tag}>'
 
     def _render_table(self, block: Dict[str, Any]) -> str:
-        """渲染表格，同时保留caption与单元格属性"""
+        """
+        渲染表格，同时保留caption与单元格属性。
+
+        参数:
+            block: table类型的block。
+
+        返回:
+            str: 包含<table>结构的HTML。
+        """
+        rows = self._normalize_table_rows(block.get("rows") or [])
         rows_html = ""
-        for row in block.get("rows", []):
+        for row in rows:
             row_cells = ""
             for cell in row.get("cells", []):
                 cell_tag = "th" if cell.get("header") or cell.get("isHeader") else "td"
@@ -461,6 +764,113 @@ class HTMLRenderer:
         caption = block.get("caption")
         caption_html = f"<caption>{self._escape_html(caption)}</caption>" if caption else ""
         return f'<div class="table-wrap"><table>{caption_html}<tbody>{rows_html}</tbody></table></div>'
+
+    def _normalize_table_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        检测并修正仅有单列的竖排表，转换为标准网格。
+
+        参数:
+            rows: 原始表格行。
+
+        返回:
+            list[dict]: 若检测到竖排表则返回转置后的行，否则原样返回。
+        """
+        if not rows:
+            return []
+        if not all(len((row.get("cells") or [])) == 1 for row in rows):
+            return rows
+        texts = [self._extract_row_text(row) for row in rows]
+        header_span = self._detect_transposed_header_span(rows, texts)
+        if not header_span:
+            return rows
+        normalized = self._transpose_single_cell_table(rows, header_span)
+        return normalized or rows
+
+    def _detect_transposed_header_span(self, rows: List[Dict[str, Any]], texts: List[str]) -> int:
+        """推断竖排表头的行数，用于后续转置"""
+        max_fields = min(8, len(rows) // 2)
+        header_span = 0
+        for idx, text in enumerate(texts):
+            if idx >= max_fields:
+                break
+            if self._is_potential_table_header(text):
+                header_span += 1
+            else:
+                break
+        if header_span < 2:
+            return 0
+        remainder = texts[header_span:]
+        if not remainder or (len(rows) - header_span) % header_span != 0:
+            return 0
+        if not any(self._looks_like_table_value(txt) for txt in remainder):
+            return 0
+        return header_span
+
+    def _is_potential_table_header(self, text: str) -> bool:
+        """根据长度与字符特征判断是否像表头字段"""
+        if not text:
+            return False
+        stripped = text.strip()
+        if not stripped or len(stripped) > 12:
+            return False
+        return not any(ch.isdigit() or ch in self.TABLE_COMPLEX_CHARS for ch in stripped)
+
+    def _looks_like_table_value(self, text: str) -> bool:
+        """判断该文本是否更像数据值，用于辅助判断转置"""
+        if not text:
+            return False
+        stripped = text.strip()
+        if len(stripped) >= 12:
+            return True
+        return any(ch.isdigit() or ch in self.TABLE_COMPLEX_CHARS for ch in stripped)
+
+    def _transpose_single_cell_table(self, rows: List[Dict[str, Any]], span: int) -> List[Dict[str, Any]]:
+        """将单列多行的表格转换为标准表头 + 若干数据行"""
+        total = len(rows)
+        if total <= span or (total - span) % span != 0:
+            return []
+        header_rows = rows[:span]
+        data_rows = rows[span:]
+        normalized: List[Dict[str, Any]] = []
+        header_cells = []
+        for row in header_rows:
+            cell = copy.deepcopy((row.get("cells") or [{}])[0])
+            cell["header"] = True
+            header_cells.append(cell)
+        normalized.append({"cells": header_cells})
+        for start in range(0, len(data_rows), span):
+            group = data_rows[start : start + span]
+            if len(group) < span:
+                break
+            normalized.append(
+                {
+                    "cells": [
+                        copy.deepcopy((item.get("cells") or [{}])[0])
+                        for item in group
+                    ]
+                }
+            )
+        return normalized
+
+    def _extract_row_text(self, row: Dict[str, Any]) -> str:
+        """提取表格行中的纯文本，方便启发式分析"""
+        cells = row.get("cells") or []
+        if not cells:
+            return ""
+        cell = cells[0]
+        texts: List[str] = []
+        for block in cell.get("blocks", []):
+            if isinstance(block, dict):
+                if block.get("type") == "paragraph":
+                    for inline in block.get("inlines") or []:
+                        if isinstance(inline, dict):
+                            value = inline.get("text")
+                        else:
+                            value = inline
+                        if value is None:
+                            continue
+                        texts.append(str(value))
+        return "".join(texts)
 
     def _render_blockquote(self, block: Dict[str, Any]) -> str:
         """渲染引用块，可嵌套其他block"""
@@ -484,12 +894,74 @@ class HTMLRenderer:
         return f'<div class="figure-placeholder">{self._escape_html(caption)}</div>'
 
     def _render_callout(self, block: Dict[str, Any]) -> str:
-        """渲染高亮提示盒，tone决定颜色"""
+        """
+        渲染高亮提示盒，tone决定颜色。
+
+        参数:
+            block: callout类型的block。
+
+        返回:
+            str: callout HTML，若内部包含不允许的块会被拆分。
+        """
         tone = block.get("tone", "info")
         title = block.get("title")
-        inner = self._render_blocks(block.get("blocks", []))
+        safe_blocks, trailing_blocks = self._split_callout_content(block.get("blocks"))
+        inner = self._render_blocks(safe_blocks)
         title_html = f"<strong>{self._escape_html(title)}</strong>" if title else ""
-        return f'<div class="callout tone-{tone}">{title_html}{inner}</div>'
+        callout_html = f'<div class="callout tone-{tone}">{title_html}{inner}</div>'
+        trailing_html = self._render_blocks(trailing_blocks) if trailing_blocks else ""
+        return callout_html + trailing_html
+
+    def _split_callout_content(
+        self, blocks: List[Dict[str, Any]] | None
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """限定callout内部仅包含轻量内容，其余块剥离到外层"""
+        if not blocks:
+            return [], []
+        safe: List[Dict[str, Any]] = []
+        trailing: List[Dict[str, Any]] = []
+        for idx, child in enumerate(blocks):
+            child_type = child.get("type")
+            if child_type == "list":
+                sanitized, overflow = self._sanitize_callout_list(child)
+                if sanitized:
+                    safe.append(sanitized)
+                if overflow:
+                    trailing.extend(overflow)
+                    trailing.extend(copy.deepcopy(blocks[idx + 1 :]))
+                    break
+            elif child_type in self.CALLOUT_ALLOWED_TYPES:
+                safe.append(child)
+            else:
+                trailing.extend(copy.deepcopy(blocks[idx:]))
+                break
+        else:
+            return safe, []
+        return safe, trailing
+
+    def _sanitize_callout_list(
+        self, block: Dict[str, Any]
+    ) -> tuple[Dict[str, Any] | None, List[Dict[str, Any]]]:
+        """当列表项包含结构型block时，将其截断移出callout"""
+        items = block.get("items") or []
+        if not items:
+            return block, []
+        sanitized_items: List[List[Dict[str, Any]]] = []
+        trailing: List[Dict[str, Any]] = []
+        for idx, item in enumerate(items):
+            safe, overflow = self._split_callout_content(item)
+            if safe:
+                sanitized_items.append(safe)
+            if overflow:
+                trailing.extend(overflow)
+                for rest in items[idx + 1 :]:
+                    trailing.extend(copy.deepcopy(rest))
+                break
+        if not sanitized_items:
+            return None, trailing
+        new_block = copy.deepcopy(block)
+        new_block["items"] = sanitized_items
+        return new_block, trailing
 
     def _render_kpi_grid(self, block: Dict[str, Any]) -> str:
         """渲染KPI卡片栅格，包含指标值与涨跌幅"""
@@ -508,7 +980,15 @@ class HTMLRenderer:
         return f'<div class="kpi-grid">{cards}</div>'
 
     def _render_widget(self, block: Dict[str, Any]) -> str:
-        """渲染Chart.js等交互组件的占位容器，并记录配置JSON"""
+        """
+        渲染Chart.js等交互组件的占位容器，并记录配置JSON。
+
+        参数:
+            block: widget类型的block，包含widgetId/props/data。
+
+        返回:
+            str: 含canvas与配置脚本的HTML。
+        """
         self.chart_counter += 1
         canvas_id = f"chart-{self.chart_counter}"
         config_id = f"chart-config-{self.chart_counter}"
@@ -631,6 +1111,8 @@ class HTMLRenderer:
                             nested_marks = inline_payload.get("marks")
                             if isinstance(nested_marks, list):
                                 marks.extend(nested_marks)
+                        elif any(key in payload for key in self.INLINE_ARTIFACT_KEYS):
+                            text_value = ""
 
         return text_value, marks
 
@@ -647,7 +1129,15 @@ class HTMLRenderer:
         return payload
 
     def _render_inline(self, run: Dict[str, Any]) -> str:
-        """渲染单个inline run，支持多种marks叠加"""
+        """
+        渲染单个inline run，支持多种marks叠加。
+
+        参数:
+            run: 含 text 与 marks 的内联节点。
+
+        返回:
+            str: 已包裹标签/样式的HTML片段。
+        """
         text_value, marks = self._normalize_inline_payload(run)
         math_mark = next((mark for mark in marks if mark.get("type") == "math"), None)
         if math_mark:
@@ -767,23 +1257,50 @@ class HTMLRenderer:
 
     def _build_css(self, tokens: Dict[str, Any]) -> str:
         """根据主题token拼接整页CSS，包括响应式与打印样式"""
-        colors = tokens.get("colors", {})
-        fonts = tokens.get("fonts", {})
-        spacing = tokens.get("spacing", {})
-        bg = colors.get("bg", "#f8f9fa")
-        text_color = colors.get("text", "#212529")
-        primary = colors.get("primary", "#007bff")
-        secondary = colors.get("secondary", "#6c757d")
-        card = colors.get("card", "#ffffff")
-        border = colors.get("border", "#dee2e6")
+        colors = tokens.get("colors") or {}
+        typography = tokens.get("typography") or {}
+        fonts = tokens.get("fonts") or typography.get("fontFamily") or {}
+        spacing = tokens.get("spacing") or {}
+        primary_palette = self._resolve_color_family(
+            colors.get("primary"),
+            {"main": "#1a365d", "light": "#2d3748", "dark": "#0f1a2d"},
+        )
+        secondary_palette = self._resolve_color_family(
+            colors.get("secondary"),
+            {"main": "#e53e3e", "light": "#fc8181", "dark": "#c53030"},
+        )
+        bg = self._resolve_color_value(
+            colors.get("bg") or colors.get("background") or colors.get("surface"),
+            "#f8f9fa",
+        )
+        text_color = self._resolve_color_value(
+            colors.get("text") or colors.get("onBackground"),
+            "#212529",
+        )
+        card = self._resolve_color_value(
+            colors.get("card") or colors.get("surfaceCard"),
+            "#ffffff",
+        )
+        border = self._resolve_color_value(
+            colors.get("border") or colors.get("divider"),
+            "#dee2e6",
+        )
         shadow = "rgba(0,0,0,0.08)"
+        container_width = spacing.get("container") or spacing.get("containerWidth") or "1200px"
+        gutter = spacing.get("gutter") or spacing.get("pagePadding") or "24px"
+        body_font = fonts.get("body") or fonts.get("primary") or "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        heading_font = fonts.get("heading") or fonts.get("primary") or fonts.get("secondary") or body_font
 
         return f"""
 :root {{
   --bg-color: {bg};
   --text-color: {text_color};
-  --primary-color: {primary};
-  --secondary-color: {secondary};
+  --primary-color: {primary_palette["main"]};
+  --primary-color-light: {primary_palette["light"]};
+  --primary-color-dark: {primary_palette["dark"]};
+  --secondary-color: {secondary_palette["main"]};
+  --secondary-color-light: {secondary_palette["light"]};
+  --secondary-color-dark: {secondary_palette["dark"]};
   --card-bg: {card};
   --border-color: {border};
   --shadow-color: {shadow};
@@ -791,8 +1308,12 @@ class HTMLRenderer:
 .dark-mode {{
   --bg-color: #121212;
   --text-color: #e0e0e0;
-  --primary-color: #0d6efd;
-  --secondary-color: #adb5bd;
+  --primary-color: #6ea8fe;
+  --primary-color-light: #91caff;
+  --primary-color-dark: #1f6feb;
+  --secondary-color: #f28b82;
+  --secondary-color-light: #f9b4ae;
+  --secondary-color-dark: #d9655c;
   --card-bg: #1f1f1f;
   --border-color: #2c2c2c;
   --shadow-color: rgba(0, 0, 0, 0.4);
@@ -800,7 +1321,7 @@ class HTMLRenderer:
 * {{ box-sizing: border-box; }}
 body {{
   margin: 0;
-  font-family: {fonts.get("body", "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif")};
+  font-family: {body_font};
   background: linear-gradient(180deg, rgba(0,0,0,0.04), rgba(0,0,0,0)) fixed, var(--bg-color);
   color: var(--text-color);
   line-height: 1.7;
@@ -954,15 +1475,15 @@ body {{
   transform: translateY(-1px);
 }}
 main {{
-  max-width: {spacing.get("container", "1200px")};
+  max-width: {container_width};
   margin: 40px auto;
-  padding: {spacing.get("gutter", "24px")};
+  padding: {gutter};
   background: var(--card-bg);
   border-radius: 16px;
   box-shadow: 0 10px 30px var(--shadow-color);
 }}
 h1, h2, h3, h4, h5, h6 {{
-  font-family: {fonts.get("heading", fonts.get("body", "sans-serif"))};
+  font-family: {heading_font};
   color: var(--text-color);
   margin-top: 2em;
   margin-bottom: 0.6em;
@@ -1281,10 +1802,11 @@ function mergeOptions(base, override) {
 }
 
 function resolveChartTypes(payload) {
+  const explicit = payload && payload.props && payload.props.type;
   const widgetType = payload && payload.widgetType ? payload.widgetType : 'chart.js/bar';
-  const primary = widgetType.includes('/') ? widgetType.split('/').pop() : widgetType;
+  const derived = widgetType && widgetType.includes('/') ? widgetType.split('/').pop() : widgetType;
   const extra = Array.isArray(payload && payload.preferredTypes) ? payload.preferredTypes : [];
-  const pipeline = [primary, ...extra, ...STABLE_CHART_TYPES];
+  const pipeline = [explicit, derived, ...extra, ...STABLE_CHART_TYPES].filter(Boolean);
   const result = [];
   pipeline.forEach(type => {
     if (type && !result.includes(type)) {
@@ -1456,6 +1978,15 @@ function buildChartOptions(payload) {
 }
 
 function instantiateChart(ctx, payload, optionsTemplate, type) {
+  if (!ctx) {
+    return null;
+  }
+  if (ctx.canvas && typeof Chart !== 'undefined' && typeof Chart.getChart === 'function') {
+    const existing = Chart.getChart(ctx.canvas);
+    if (existing) {
+      existing.destroy();
+    }
+  }
   const data = cloneDeep(payload && payload.data ? payload.data : {});
   const config = {
     type,

@@ -36,6 +36,14 @@ class ChapterJsonParseError(ValueError):
         self.raw_text = raw_text
 
 
+class ChapterContentError(ValueError):
+    """
+    章节内容稀疏异常。
+
+    当LLM仅输出标题或正文不足以支撑一章时触发，驱动重试以保证报告质量。
+    """
+
+
 class ChapterGenerationNode(BaseNode):
     """
     负责按章节调用LLM并校验JSON结构。
@@ -71,6 +79,12 @@ class ChapterGenerationNode(BaseNode):
         "sub": "subscript",
         "sup": "superscript",
     }
+    # 章节若仅包含标题或字符过少则视为失败，强制LLM重新生成
+    _MIN_NON_HEADING_BLOCKS = 2
+    _MIN_BODY_CHARACTERS = 400
+    _PARAGRAPH_FRAGMENT_MAX_CHARS = 80
+    _PARAGRAPH_FRAGMENT_NO_TERMINATOR_MAX_CHARS = 240
+    _TERMINATION_PUNCTUATION = set("。！？!?；;……")
 
     def __init__(self, llm_client, validator: IRValidator, storage: ChapterStorage):
         """
@@ -93,7 +107,23 @@ class ChapterGenerationNode(BaseNode):
         stream_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """针对单个章节调用LLM，校验/落盘章节JSON并返回结构化结果"""
+        """
+        针对单个章节调用LLM，校验/落盘章节JSON并返回结构化结果。
+
+        参数:
+            section: 模板切片生成的章节对象，包含标题/顺序/slug。
+            context: Agent构造的共享上下文（主题、篇幅、布局等）。
+            run_dir: 章节存盘目录，由 `ChapterStorage.start_session` 返回。
+            stream_callback: 可选流式回调，将LLM delta 推送给前端。
+            **kwargs: 透传温度、top_p等采样参数。
+
+        返回:
+            dict: 通过IR校验的章节JSON。
+
+        异常:
+            ChapterJsonParseError: 多次尝试后仍无法解析合法JSON。
+            ChapterContentError: 正文密度不足或只有标题，需要触发重试。
+        """
         chapter_meta = {
             "chapterId": section.chapter_id,
             "slug": section.slug,
@@ -121,24 +151,48 @@ class ChapterGenerationNode(BaseNode):
         self._sanitize_chapter_blocks(chapter_json)
 
         valid, errors = self.validator.validate_chapter(chapter_json)
+        content_error: ChapterContentError | None = None
+        if valid:
+            try:
+                self._ensure_content_density(chapter_json)
+            except ChapterContentError as exc:
+                content_error = exc
+
+        error_messages: List[str] = []
+        if not valid and errors:
+            error_messages.extend(errors)
+        if content_error:
+            error_messages.append(str(content_error))
+
         self.storage.persist_chapter(
             run_dir,
             chapter_meta,
             chapter_json,
-            errors=None if valid else errors,
+            errors=None if not error_messages else error_messages,
         )
 
         if not valid:
             raise ValueError(
                 f"{section.title} 章节JSON校验失败: {'; '.join(errors[:5])}"
             )
+        if content_error:
+            raise content_error
 
         return chapter_json
 
     # ====== 内部方法 ======
 
     def _build_payload(self, section: TemplateSection, context: Dict[str, Any]) -> Dict[str, Any]:
-        """构造LLM输入payload"""
+        """
+        构造LLM输入payload。
+
+        参数:
+            section: 当前要生成的章节，提供标题/编号/提纲。
+            context: 全局上下文字典，包含主题、三引擎报告、篇幅规划等。
+
+        返回:
+            dict: 可以直接序列化进提示词的payload，兼顾章节信息与全局约束。
+        """
         reports = context.get("reports", {})
         # 章节篇幅规划（来自WordBudgetNode），用于指导字数与强调点
         chapter_plan_map = context.get("chapter_directives", {})
@@ -204,7 +258,19 @@ class ChapterGenerationNode(BaseNode):
         section_meta: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> str:
-        """流式调用LLM并实时写入raw文件，同时通过回调将delta抛出。"""
+        """
+        流式调用LLM并实时写入raw文件，同时通过回调将delta抛出。
+
+        参数:
+            user_message: 拼装好的用户提示词。
+            chapter_dir: 章节的本地缓存目录，用于存放 stream.raw。
+            stream_callback: SSE流式推送的回调函数。
+            section_meta: 附带的章节ID/标题，用于回调payload。
+            **kwargs: 透传温度、top_p等参数。
+
+        返回:
+            str: 将所有delta拼接后的原始文本。
+        """
         chunks: List[str] = []
         with self.storage.capture_stream(chapter_dir) as stream_fp:
             stream = self.llm_client.stream_invoke(
@@ -225,7 +291,18 @@ class ChapterGenerationNode(BaseNode):
         return "".join(chunks)
 
     def _parse_chapter(self, raw_text: str) -> Dict[str, Any]:
-        """清洗LLM输出并解析JSON"""
+        """
+        清洗LLM输出并解析JSON。
+
+        参数:
+            raw_text: LLM原始输出（可能包含```包裹或额外说明）。
+
+        返回:
+            dict: 章节JSON对象，至少包含 chapterId/title/blocks。
+
+        异常:
+            ChapterJsonParseError: 多种修复策略仍无法解析合法JSON。
+        """
         cleaned = raw_text.strip()
         if cleaned.startswith("```json"):
             cleaned = cleaned[7:]
@@ -275,7 +352,15 @@ class ChapterGenerationNode(BaseNode):
         raise ValueError("章节JSON缺少chapter字段")
 
     def _repair_llm_json(self, text: str) -> str:
-        """处理常见的LLM错误（如\":=导致的非法JSON）"""
+        """
+        处理常见的LLM错误（如":=导致的非法JSON）。
+
+        参数:
+            text: 原始章节JSON文本。
+
+        返回:
+            str: 修复后的文本；若未做改动则返回原内容。
+        """
         repaired = text
         mutated = False
 
@@ -453,7 +538,12 @@ class ChapterGenerationNode(BaseNode):
         return fixed
 
     def _sanitize_chapter_blocks(self, chapter: Dict[str, Any]):
-        """修正常见的结构性错误（例如list.items嵌套过深）"""
+        """
+        修正常见的结构性错误（例如list.items嵌套过深）。
+
+        参数:
+            chapter: 章节JSON对象，会在原地被清理和规整。
+        """
 
         def walk(blocks: List[Dict[str, Any]] | None):
             """递归检查并修复嵌套结构，保证每个block合法"""
@@ -488,6 +578,109 @@ class ChapterGenerationNode(BaseNode):
 
         walk(chapter.get("blocks"))
 
+        blocks = chapter.get("blocks")
+        if isinstance(blocks, list):
+            chapter["blocks"] = self._merge_fragment_sequences(blocks)
+
+    def _ensure_content_density(self, chapter: Dict[str, Any]):
+        """
+        校验章节正文密度。
+
+        若blocks缺失、除标题外无有效区块，或正文字符数低于阈值，
+        则视为章节内容异常，触发ChapterContentError以便上游重试。
+
+        参数:
+            chapter: 当前章节JSON。
+
+        异常:
+            ChapterContentError: 当正文区块数量或字符数达不到下限时抛出。
+        """
+        blocks = chapter.get("blocks")
+        if not isinstance(blocks, list) or not blocks:
+            raise ChapterContentError("章节缺少正文区块，无法输出内容")
+
+        non_heading_blocks = [
+            block
+            for block in blocks
+            if isinstance(block, dict)
+            and block.get("type") not in {"heading", "divider", "toc"}
+        ]
+        body_characters = self._count_body_characters(blocks)
+
+        if len(non_heading_blocks) < self._MIN_NON_HEADING_BLOCKS or body_characters < self._MIN_BODY_CHARACTERS:
+            raise ChapterContentError(
+                f"{chapter.get('title') or '该章节'} 正文不足：有效区块 {len(non_heading_blocks)} 个，估算字符数 {body_characters}"
+            )
+
+    def _count_body_characters(self, blocks: Any) -> int:
+        """
+        递归统计正文字符数。
+
+        - 忽略heading/divider/widget等非正文类型；
+        - 对paragraph/list/table/callout等结构抽取嵌套文本；
+        - 仅用于粗粒度判断篇幅是否合理。
+
+        参数:
+            blocks: 章节的 blocks 列表或子树。
+
+        返回:
+            int: 估算的正文字符数量。
+        """
+
+        def walk(node: Any) -> int:
+            if node is None:
+                return 0
+            if isinstance(node, list):
+                return sum(walk(item) for item in node)
+            if isinstance(node, str):
+                return len(node.strip())
+            if not isinstance(node, dict):
+                return 0
+
+            block_type = node.get("type")
+            if block_type in {"heading", "divider", "toc", "widget"}:
+                return 0
+
+            if block_type == "paragraph":
+                inlines = node.get("inlines")
+                if isinstance(inlines, list):
+                    total = 0
+                    for run in inlines:
+                        if isinstance(run, dict):
+                            text = run.get("text")
+                            if isinstance(text, str):
+                                total += len(text.strip())
+                    return total
+                text_value = node.get("text")
+                if isinstance(text_value, str):
+                    return len(text_value.strip())
+                return len(self._extract_block_text(node).strip())
+
+            if block_type == "list":
+                total = 0
+                for item in node.get("items", []):
+                    total += walk(item)
+                return total
+
+            if block_type in {"blockquote", "callout"}:
+                return walk(node.get("blocks"))
+
+            if block_type == "table":
+                total = 0
+                for row in node.get("rows", []):
+                    cells = row.get("cells") or []
+                    for cell in cells:
+                        total += walk(cell.get("blocks"))
+                return total
+
+            nested = node.get("blocks")
+            if isinstance(nested, list):
+                return walk(nested)
+
+            return len(self._extract_block_text(node).strip())
+
+        return walk(blocks)
+
     def _sanitize_block_content(self, block: Dict[str, Any]):
         """根据类型做精细化修复，例如清理paragraph内的非法inline mark"""
         block_type = block.get("type")
@@ -505,7 +698,134 @@ class ChapterGenerationNode(BaseNode):
             normalized_runs = [self._as_inline_run(self._extract_block_text(block))]
         if not normalized_runs:
             normalized_runs = [self._as_inline_run("")]
-        block["inlines"] = normalized_runs
+        block["inlines"] = self._strip_inline_artifacts(normalized_runs)
+
+    def _strip_inline_artifacts(self, inlines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """移除被LLM误写入的JSON哨兵文本，防止渲染出`{\"type\": \"\"}`等垃圾字符"""
+        cleaned: List[Dict[str, Any]] = []
+        for run in inlines or []:
+            if not isinstance(run, dict):
+                continue
+            text = run.get("text")
+            if isinstance(text, str):
+                stripped = text.strip()
+                if stripped.startswith("{") and stripped.endswith("}"):
+                    try:
+                        payload = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        payload = None
+                    if isinstance(payload, dict) and set(payload.keys()).issubset({"type", "value"}):
+                        continue
+            cleaned.append(run)
+        return cleaned or [self._as_inline_run("")]
+
+    def _merge_fragment_sequences(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """合并被LLM拆成多段的句子片段，避免HTML出现大量孤立<p>"""
+        if not isinstance(blocks, list):
+            return blocks
+
+        merged: List[Dict[str, Any]] = []
+        fragment_buffer: List[Dict[str, Any]] = []
+
+        def flush_buffer():
+            nonlocal fragment_buffer
+            if not fragment_buffer:
+                return
+            if len(fragment_buffer) == 1:
+                merged.append(fragment_buffer[0])
+            else:
+                merged.append(self._combine_paragraph_fragments(fragment_buffer))
+            fragment_buffer = []
+
+        for block in blocks:
+            if self._is_paragraph_fragment(block):
+                fragment_buffer.append(block)
+                continue
+            flush_buffer()
+            merged.append(self._merge_nested_fragments(block))
+
+        flush_buffer()
+        return merged
+
+    def _merge_nested_fragments(self, block: Dict[str, Any]) -> Dict[str, Any]:
+        """对嵌套结构（callout/list/table）递归处理片段合并"""
+        block_type = block.get("type")
+        if block_type in {"callout", "blockquote"}:
+            nested = block.get("blocks")
+            if isinstance(nested, list):
+                block["blocks"] = self._merge_fragment_sequences(nested)
+        elif block_type == "list":
+            items = block.get("items")
+            if isinstance(items, list):
+                for entry in items:
+                    if isinstance(entry, list):
+                        merged_entry = self._merge_fragment_sequences(entry)
+                        entry[:] = merged_entry
+        elif block_type == "table":
+            for row in block.get("rows", []):
+                cells = row.get("cells") or []
+                for cell in cells:
+                    nested_blocks = cell.get("blocks")
+                    if isinstance(nested_blocks, list):
+                        cell["blocks"] = self._merge_fragment_sequences(nested_blocks)
+        return block
+
+    def _combine_paragraph_fragments(self, fragments: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """将多个句子片段合并为单个paragraph block"""
+        template = dict(fragments[0])
+        combined_inlines: List[Dict[str, Any]] = []
+        for fragment in fragments:
+            runs = fragment.get("inlines")
+            if isinstance(runs, list) and runs:
+                combined_inlines.extend(runs)
+            else:
+                fallback_text = self._extract_block_text(fragment)
+                combined_inlines.append(self._as_inline_run(fallback_text))
+        if not combined_inlines:
+            combined_inlines.append(self._as_inline_run(""))
+        template["inlines"] = combined_inlines
+        return template
+
+    def _is_paragraph_fragment(self, block: Dict[str, Any]) -> bool:
+        """判断paragraph是否为被错误拆分的短片段"""
+        if not isinstance(block, dict) or block.get("type") != "paragraph":
+            return False
+        inlines = block.get("inlines")
+        text = ""
+        has_marks = False
+        if isinstance(inlines, list) and inlines:
+            parts: List[str] = []
+            for run in inlines:
+                if not isinstance(run, dict):
+                    continue
+                parts.append(str(run.get("text") or ""))
+                marks = run.get("marks")
+                if isinstance(marks, list) and any(marks):
+                    has_marks = True
+            text = "".join(parts)
+        else:
+            text = self._extract_block_text(block)
+        stripped = (text or "").strip()
+        if not stripped:
+            return True
+        if has_marks:
+            return False
+        if "\n" in stripped:
+            return False
+
+        short_limit = self._PARAGRAPH_FRAGMENT_MAX_CHARS
+        long_limit = getattr(
+            self,
+            "_PARAGRAPH_FRAGMENT_NO_TERMINATOR_MAX_CHARS",
+            short_limit * 3,
+        )
+
+        if stripped[-1] in self._TERMINATION_PUNCTUATION:
+            return len(stripped) <= short_limit
+
+        if len(stripped) > long_limit:
+            return False
+        return True
 
     def _coerce_inline_run(self, run: Any) -> List[Dict[str, Any]]:
         """将任意inline写法规整为合法run"""
