@@ -9,6 +9,7 @@ import json
 
 from ..ir import (
     ALLOWED_BLOCK_TYPES,
+    ALLOWED_INLINE_MARKS,
     CHAPTER_JSON_SCHEMA_TEXT,
     IR_VERSION,
 )
@@ -317,6 +318,41 @@ SYSTEM_PROMPT_CHAPTER_JSON = f"""
 严禁添加除JSON以外的任何文本或注释。
 """
 
+SYSTEM_PROMPT_CHAPTER_JSON_REPAIR = f"""
+你现在扮演Report Engine的“章节JSON修复官”，负责在章节草稿无法通过IR校验时进行兜底修复。
+
+请牢记：
+1. 所有chapter必须满足IR版本 {IR_VERSION} 约束，仅允许以下block.type：{', '.join(ALLOWED_BLOCK_TYPES)}；
+2. paragraph.inlines中的marks必须来自以下集合：{', '.join(ALLOWED_INLINE_MARKS)}；
+3. 允许的结构、字段与嵌套规则全部写在《CHAPTER JSON SCHEMA》中，任何缺少字段、数组嵌套错误或list.items不是二维数组的情况都必须修复；
+4. 不得更改事实、数值与结论，只能对结构/字段名/嵌套层级做最小修改以通过校验；
+5. 最终输出只能包含合法JSON，格式严格为：{{"chapter": {{...修复后的章节JSON...}}}}，禁止额外解释或Markdown。
+
+<CHAPTER JSON SCHEMA>
+{CHAPTER_JSON_SCHEMA_TEXT}
+</CHAPTER JSON SCHEMA>
+
+只返回JSON，不要添加注释或自然语言。
+"""
+
+SYSTEM_PROMPT_CHAPTER_JSON_RECOVERY = f"""
+你是Report/Forum/Insight/Media联合的“JSON抢修官”，会拿到章节生成时的全部约束(generationPayload)以及原始失败输出(rawChapterOutput)。
+
+请遵守：
+1. 章节必须满足IR版本 {IR_VERSION} 规范，block.type 仅能使用：{', '.join(ALLOWED_BLOCK_TYPES)}；
+2. paragraph.inlines中的marks仅可出现：{', '.join(ALLOWED_INLINE_MARKS)}，并保留原始文字顺序；
+3. 请以 generationPayload 中的 section 信息为主导，heading.text 与 anchor 必须与章节slug保持一致；
+4. 仅对JSON语法/字段/嵌套做最小必要修复，不改写事实与结论；
+5. 输出严格遵循 {{\"chapter\": {{...}}}} 格式，不添加说明。
+
+输入字段：
+- generationPayload：章节原始需求与素材，请完整遵守；
+- rawChapterOutput：无法解析的JSON文本，请尽可能复用其中内容；
+- section：章节元信息，便于保持锚点/标题一致。
+
+请直接返回修复后的JSON。
+"""
+
 # 文档标题/目录/主题设计提示词
 SYSTEM_PROMPT_DOCUMENT_LAYOUT = f"""
 你是报告首席设计官，需要结合模板大纲与三个分析引擎的内容，为整本报告确定最终的标题、导语区、目录样式与美学要素。
@@ -364,6 +400,36 @@ def build_chapter_user_prompt(payload: dict) -> str:
 
     统一使用 `json.dumps(..., indent=2, ensure_ascii=False)`，便于LLM读取。
     """
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_chapter_repair_prompt(chapter: dict, errors, original_text=None) -> str:
+    """
+    构造章节修复输入payload，包含原始章节与校验错误。
+    """
+    payload: dict = {
+        "failedChapter": chapter,
+        "validatorErrors": errors,
+    }
+    if original_text:
+        snippet = original_text[-2000:]
+        payload["rawOutputTail"] = snippet
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_chapter_recovery_payload(
+    section: dict, generation_payload: dict, raw_output: str
+) -> str:
+    """
+    构造跨引擎JSON抢修输入，附带章节元信息、生成指令与原始输出。
+
+    为避免提示词过长，仅保留原始输出的尾部片段以定位问题。
+    """
+    payload = {
+        "section": section,
+        "generationPayload": generation_payload,
+        "rawChapterOutput": raw_output[-8000:] if isinstance(raw_output, str) else raw_output,
+    }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 

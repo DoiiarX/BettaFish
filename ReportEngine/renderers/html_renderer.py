@@ -59,6 +59,8 @@ class HTMLRenderer:
         self.heading_label_map: Dict[str, Dict[str, Any]] = {}
         self.primary_heading_index = 0
         self.secondary_heading_index = 0
+        self.toc_rendered = False
+        self.hero_kpi_signature: tuple | None = None
 
     # ====== 公共入口 ======
 
@@ -78,6 +80,7 @@ class HTMLRenderer:
         self.heading_counter = 0
         self.metadata = self.document.get("metadata", {}) or {}
         raw_chapters = self.document.get("chapters", []) or []
+        self.toc_rendered = False
         self.chapters = self._prepare_chapters(raw_chapters)
         self.chapter_anchor_map = {
             chapter.get("chapterId"): chapter.get("anchor")
@@ -90,12 +93,14 @@ class HTMLRenderer:
         metadata = self.metadata
         theme_tokens = metadata.get("themeTokens") or self.document.get("themeTokens", {})
         title = metadata.get("title") or metadata.get("query") or "智能舆情报告"
+        hero_kpis = (metadata.get("hero") or {}).get("kpis")
+        self.hero_kpi_signature = self._kpi_signature_from_items(hero_kpis)
 
         head = self._render_head(title, theme_tokens)
         body = self._render_body()
         return f"<!DOCTYPE html>\n<html lang=\"zh-CN\" class=\"no-js\">\n{head}\n{body}\n</html>"
 
-    # ====== Head / Body ======
+    # ====== 头部 / 正文 ======
 
     def _resolve_color_value(self, value: Any, fallback: str) -> str:
         """从颜色token中提取字符串值"""
@@ -188,10 +193,22 @@ class HTMLRenderer:
         chapters = "".join(self._render_chapter(chapter) for chapter in self.chapters)
         widget_scripts = "\n".join(self.widget_scripts)
         hydration = self._hydration_script()
+        overlay = """
+<div id="export-overlay" class="export-overlay no-print" aria-hidden="true">
+  <div class="export-dialog" role="status" aria-live="assertive">
+    <div class="export-spinner" aria-hidden="true"></div>
+    <p class="export-status">正在导出PDF，请稍候...</p>
+    <div class="export-progress" role="progressbar" aria-valuetext="正在导出">
+      <div class="export-progress-bar"></div>
+    </div>
+  </div>
+</div>
+""".strip()
 
         return f"""
 <body>
 {header}
+{overlay}
 <main>
 {cover}
 {hero}
@@ -202,7 +219,7 @@ class HTMLRenderer:
 {hydration}
 </body>""".strip()
 
-    # ====== Header / Meta / TOC ======
+    # ====== 页眉 / 元信息 / 目录 ======
 
     def _render_header(self) -> str:
         """
@@ -224,7 +241,7 @@ class HTMLRenderer:
   <div class="header-actions">
     <button id="theme-toggle" class="action-btn" type="button">🌗 主题切换</button>
     <button id="print-btn" class="action-btn" type="button">🖨️ 打印</button>
-    <button id="export-btn" class="action-btn" type="button">⬇️ 导出PDF</button>
+    <!-- <button id="export-btn" class="action-btn" type="button">⬇️ 导出PDF</button> -->
   </div>
 </header>
 """.strip()
@@ -320,12 +337,15 @@ class HTMLRenderer:
         """
         if not self.toc_entries:
             return ""
+        if self.toc_rendered:
+            return ""
         toc_config = self.metadata.get("toc") or {}
         toc_title = toc_config.get("title") or "📚 目录"
         toc_items = "".join(
             self._format_toc_entry(entry)
             for entry in self.toc_entries
         )
+        self.toc_rendered = True
         return f"""
 <nav class="toc">
   <div class="toc-title">{self._escape_html(toc_title)}</div>
@@ -407,6 +427,7 @@ class HTMLRenderer:
         extracted: List[Dict[str, Any]] = []
 
         def traverse(node: Any) -> None:
+            """递归遍历block树，识别text字段内潜在的嵌套block JSON"""
             if isinstance(node, dict):
                 for key, value in list(node.items()):
                     if key == "text" and isinstance(value, str):
@@ -632,7 +653,7 @@ class HTMLRenderer:
             words += numerals[ones]
         return words
 
-    # ====== 章节 & Block 渲染 ======
+    # ====== 章节与块级渲染 ======
 
     def _render_chapter(self, chapter: Dict[str, Any]) -> str:
         """
@@ -688,10 +709,36 @@ class HTMLRenderer:
         }
         handler = handlers.get(block_type)
         if handler:
-            return handler(block)
+            html_fragment = handler(block)
+            return self._wrap_error_block(html_fragment, block)
         if isinstance(block.get("blocks"), list):
-            return self._render_blocks(block["blocks"])
-        return f'<pre class="unknown-block">{self._escape_html(json.dumps(block, ensure_ascii=False, indent=2))}</pre>'
+            html_fragment = self._render_blocks(block["blocks"])
+            return self._wrap_error_block(html_fragment, block)
+        fallback = f'<pre class="unknown-block">{self._escape_html(json.dumps(block, ensure_ascii=False, indent=2))}</pre>'
+        return self._wrap_error_block(fallback, block)
+
+    def _wrap_error_block(self, html_fragment: str, block: Dict[str, Any]) -> str:
+        """若block标记了error元数据，则包裹提示容器并注入tooltip。"""
+        if not html_fragment:
+            return html_fragment
+        meta = block.get("meta") or {}
+        log_ref = meta.get("errorLogRef")
+        if not isinstance(log_ref, dict):
+            return html_fragment
+        raw_preview = (meta.get("rawJsonPreview") or "")[:1200]
+        error_message = meta.get("errorMessage") or "LLM返回块解析错误"
+        importance = meta.get("importance") or "standard"
+        ref_label = ""
+        if log_ref.get("relativeFile") and log_ref.get("entryId"):
+            ref_label = f"{log_ref['relativeFile']}#{log_ref['entryId']}"
+        tooltip = f"{error_message} | {ref_label}".strip()
+        attr_raw = self._escape_attr(raw_preview or tooltip)
+        attr_title = self._escape_attr(tooltip)
+        class_suffix = self._escape_attr(importance)
+        return (
+            f'<div class="llm-error-block importance-{class_suffix}" '
+            f'data-raw="{attr_raw}" title="{attr_title}">{html_fragment}</div>'
+        )
 
     def _render_heading(self, block: Dict[str, Any]) -> str:
         """渲染heading block，确保锚点存在"""
@@ -965,6 +1012,8 @@ class HTMLRenderer:
 
     def _render_kpi_grid(self, block: Dict[str, Any]) -> str:
         """渲染KPI卡片栅格，包含指标值与涨跌幅"""
+        if self._should_skip_overview_kpi(block):
+            return ""
         cards = ""
         for item in block.get("items", []):
             delta = item.get("delta")
@@ -978,6 +1027,75 @@ class HTMLRenderer:
             </div>
             """
         return f'<div class="kpi-grid">{cards}</div>'
+
+    def _merge_dicts(
+        self, base: Dict[str, Any] | None, override: Dict[str, Any] | None
+    ) -> Dict[str, Any]:
+        """
+        递归合并两个字典，override覆盖base，均为新副本，避免副作用。
+        """
+        result = copy.deepcopy(base) if isinstance(base, dict) else {}
+        if not isinstance(override, dict):
+            return result
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = self._merge_dicts(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
+
+    def _looks_like_chart_dataset(self, candidate: Any) -> bool:
+        """启发式判断对象是否包含Chart.js常见的labels/datasets结构"""
+        if not isinstance(candidate, dict):
+            return False
+        labels = candidate.get("labels")
+        datasets = candidate.get("datasets")
+        return isinstance(labels, list) or isinstance(datasets, list)
+
+    def _coerce_chart_data_structure(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        兼容LLM输出的Chart.js完整配置（含type/data/options）。
+        若data中嵌套一个真正的labels/datasets结构，则提取并返回该结构。
+        """
+        if not isinstance(data, dict):
+            return {}
+        if self._looks_like_chart_dataset(data):
+            return data
+        for key in ("data", "chartData", "payload"):
+            nested = data.get(key)
+            if self._looks_like_chart_dataset(nested):
+                return copy.deepcopy(nested)
+        return data
+
+    def _prepare_widget_payload(
+        self, block: Dict[str, Any]
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        预处理widget数据，兼容部分block将Chart.js配置写入data字段的情况。
+
+        返回:
+            tuple(props, data): 归一化后的props与chart数据
+        """
+        props = copy.deepcopy(block.get("props") or {})
+        raw_data = block.get("data")
+        data_copy = copy.deepcopy(raw_data) if isinstance(raw_data, dict) else raw_data
+        widget_type = block.get("widgetType") or ""
+        chart_like = isinstance(widget_type, str) and widget_type.startswith("chart.js")
+
+        if chart_like and isinstance(data_copy, dict):
+            inline_options = data_copy.pop("options", None)
+            inline_type = data_copy.pop("type", None)
+            normalized_data = self._coerce_chart_data_structure(data_copy)
+            if isinstance(inline_options, dict):
+                props["options"] = self._merge_dicts(props.get("options"), inline_options)
+            if isinstance(inline_type, str) and inline_type and not props.get("type"):
+                props["type"] = inline_type
+        elif isinstance(data_copy, dict):
+            normalized_data = data_copy
+        else:
+            normalized_data = {}
+
+        return props, normalized_data
 
     def _render_widget(self, block: Dict[str, Any]) -> str:
         """
@@ -993,11 +1111,12 @@ class HTMLRenderer:
         canvas_id = f"chart-{self.chart_counter}"
         config_id = f"chart-config-{self.chart_counter}"
 
+        props, normalized_data = self._prepare_widget_payload(block)
         payload = {
             "widgetId": block.get("widgetId"),
             "widgetType": block.get("widgetType"),
-            "props": block.get("props", {}),
-            "data": block.get("data", {}),
+            "props": props,
+            "data": normalized_data,
             "dataRef": block.get("dataRef"),
         }
         config_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
@@ -1005,9 +1124,9 @@ class HTMLRenderer:
             f'<script type="application/json" id="{config_id}">{config_json}</script>'
         )
 
-        title = block.get("props", {}).get("title")
+        title = props.get("title")
         title_html = f'<div class="chart-title">{self._escape_html(title)}</div>' if title else ""
-        fallback_html = self._render_widget_fallback(block)
+        fallback_html = self._render_widget_fallback(normalized_data)
         return f"""
         <div class="chart-card">
           {title_html}
@@ -1018,9 +1137,10 @@ class HTMLRenderer:
         </div>
         """
 
-    def _render_widget_fallback(self, block: Dict[str, Any]) -> str:
+    def _render_widget_fallback(self, data: Dict[str, Any]) -> str:
         """渲染图表数据的文本兜底视图，避免Chart.js加载失败时出现空白"""
-        data = block.get("data") or {}
+        if not isinstance(data, dict):
+            return ""
         labels = data.get("labels") or []
         datasets = data.get("datasets") or []
         if not labels or not datasets:
@@ -1051,7 +1171,57 @@ class HTMLRenderer:
         """
         return table_html
 
-    # ====== Inline 渲染 ======
+    # ====== 前置信息防护 ======
+
+    def _kpi_signature_from_items(self, items: Any) -> tuple | None:
+        """将KPI数组转换为可比较的签名"""
+        if not isinstance(items, list):
+            return None
+        normalized = []
+        for raw in items:
+            normalized_item = self._normalize_kpi_item(raw)
+            if normalized_item:
+                normalized.append(normalized_item)
+        return tuple(normalized) if normalized else None
+
+    def _normalize_kpi_item(self, item: Any) -> tuple[str, str, str, str, str] | None:
+        """
+        将单条KPI记录规整为可对比的签名。
+
+        参数:
+            item: KPI数组中的原始字典，可能缺失字段或类型混杂。
+
+        返回:
+            tuple | None: (label, value, unit, delta, tone) 的五元组；若输入非法则为None。
+        """
+        if not isinstance(item, dict):
+            return None
+
+        def normalize(value: Any) -> str:
+            """统一各类值的表现形式，便于生成稳定签名"""
+            if value is None:
+                return ""
+            if isinstance(value, (int, float)):
+                return str(value)
+            return str(value).strip()
+
+        label = normalize(item.get("label"))
+        value = normalize(item.get("value"))
+        unit = normalize(item.get("unit"))
+        delta = normalize(item.get("delta"))
+        tone = normalize(item.get("deltaTone") or item.get("tone"))
+        return label, value, unit, delta, tone
+
+    def _should_skip_overview_kpi(self, block: Dict[str, Any]) -> bool:
+        """若KPI内容与封面一致，则判定为重复总览"""
+        if not self.hero_kpi_signature:
+            return False
+        block_signature = self._kpi_signature_from_items(block.get("items"))
+        if not block_signature:
+            return False
+        return block_signature == self.hero_kpi_signature
+
+    # ====== 行内渲染 ======
 
     def _normalize_inline_payload(self, run: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]]]:
         """将嵌套inline node展平成基础文本与marks"""
@@ -1253,7 +1423,7 @@ class HTMLRenderer:
         escaped = html.escape(self._safe_text(value), quote=True)
         return escaped.replace("\n", " ").replace("\r", " ")
 
-    # ====== CSS / JS ======
+    # ====== CSS / JS（样式与脚本） ======
 
     def _build_css(self, tokens: Dict[str, Any]) -> str:
         """根据主题token拼接整页CSS，包括响应式与打印样式"""
@@ -1425,6 +1595,41 @@ body {{
   font-weight: 500;
   margin-top: 0;
 }}
+.llm-error-block {{
+  border: 1px dashed var(--secondary-color);
+  border-radius: 12px;
+  padding: 12px;
+  margin: 12px 0;
+  background: rgba(229,62,62,0.06);
+  position: relative;
+}}
+.llm-error-block.importance-critical {{
+  border-color: var(--secondary-color-dark);
+  background: rgba(229,62,62,0.12);
+}}
+.llm-error-block::after {{
+  content: attr(data-raw);
+  white-space: pre-wrap;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  max-height: 240px;
+  overflow: auto;
+  background: rgba(0,0,0,0.85);
+  color: #fff;
+  font-size: 0.85rem;
+  padding: 12px;
+  border-radius: 10px;
+  margin-bottom: 8px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  z-index: 20;
+}}
+.llm-error-block:hover::after {{
+  opacity: 1;
+}}
 .report-header h1 {{
   margin: 0;
   font-size: 1.6rem;
@@ -1473,6 +1678,75 @@ body {{
 }}
 .action-btn:hover {{
   transform: translateY(-1px);
+}}
+body.exporting {{
+  cursor: progress;
+}}
+.export-overlay {{
+  position: fixed;
+  inset: 0;
+  background: rgba(3, 9, 26, 0.55);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+  z-index: 999;
+}}
+.export-overlay.active {{
+  opacity: 1;
+  pointer-events: all;
+}}
+.export-dialog {{
+  background: rgba(12, 19, 38, 0.92);
+  padding: 24px 32px;
+  border-radius: 18px;
+  color: #fff;
+  text-align: center;
+  min-width: 280px;
+  box-shadow: 0 16px 40px rgba(0,0,0,0.45);
+}}
+.export-spinner {{
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 3px solid rgba(255,255,255,0.2);
+  border-top-color: var(--secondary-color);
+  margin: 0 auto 16px;
+  animation: export-spin 1s linear infinite;
+}}
+.export-status {{
+  margin: 0;
+  font-size: 1rem;
+}}
+.export-progress {{
+  width: 220px;
+  height: 6px;
+  background: rgba(255,255,255,0.25);
+  border-radius: 999px;
+  overflow: hidden;
+  margin: 20px auto 0;
+  position: relative;
+}}
+.export-progress-bar {{
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 45%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
+  animation: export-progress 1.4s ease-in-out infinite;
+}}
+@keyframes export-spin {{
+  from {{ transform: rotate(0deg); }}
+  to {{ transform: rotate(360deg); }}
+}}
+@keyframes export-progress {{
+  0% {{ left: -45%; }}
+  50% {{ left: 20%; }}
+  100% {{ left: 110%; }}
 }}
 main {{
   max-width: {container_width};
@@ -1726,6 +2000,23 @@ pre.code-block {{
   main {{
     box-shadow: none;
     margin: 0;
+  }}
+  .chapter > *,
+  .hero-section,
+  .callout,
+  .chart-card,
+  .kpi-grid,
+  .table-wrap,
+  figure,
+  blockquote {{
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }}
+  .chapter h2,
+  .chapter h3,
+  .chapter h4 {{
+    break-after: avoid;
+    page-break-after: avoid;
   }}
 }}
 """
@@ -2053,32 +2344,112 @@ function hydrateCharts() {
   });
 }
 
+function getExportOverlayParts() {
+  const overlay = document.getElementById('export-overlay');
+  if (!overlay) {
+    return null;
+  }
+  return {
+    overlay,
+    status: overlay.querySelector('.export-status')
+  };
+}
+
+function showExportOverlay(message) {
+  const parts = getExportOverlayParts();
+  if (!parts) return;
+  if (message && parts.status) {
+    parts.status.textContent = message;
+  }
+  parts.overlay.classList.add('active');
+  document.body.classList.add('exporting');
+}
+
+function updateExportOverlay(message) {
+  if (!message) return;
+  const parts = getExportOverlayParts();
+  if (parts && parts.status) {
+    parts.status.textContent = message;
+  }
+}
+
+function hideExportOverlay(delay) {
+  const parts = getExportOverlayParts();
+  if (!parts) return;
+  const close = () => {
+    parts.overlay.classList.remove('active');
+    document.body.classList.remove('exporting');
+  };
+  if (delay && delay > 0) {
+    setTimeout(close, delay);
+  } else {
+    close();
+  }
+}
+
 function exportPdf() {
   const target = document.querySelector('main');
-  if (!target || typeof html2canvas === 'undefined' || typeof jspdf === 'undefined') {
+  if (!target || typeof jspdf === 'undefined' || typeof jspdf.jsPDF !== 'function') {
     alert('PDF导出依赖未就绪');
     return;
   }
-  html2canvas(target, {scale: 2}).then(canvas => {
-    const imgData = canvas.toDataURL('image/png');
-    const pdf = new jspdf.jsPDF('p', 'mm', 'a4');
-    const pageWidth = pdf.internal.pageSize.getWidth();
-    const pageHeight = pdf.internal.pageSize.getHeight();
-    const imgHeight = canvas.height * pageWidth / canvas.width;
-    let heightLeft = imgHeight;
-    let position = 0;
-
-    pdf.addImage(imgData, 'PNG', 0, position, pageWidth, imgHeight);
-    heightLeft -= pageHeight;
-
-    while (heightLeft > 0) {
-      position = heightLeft - imgHeight;
-      pdf.addPage();
-      pdf.addImage(imgData, 'PNG', 0, position, pageWidth, imgHeight);
-      heightLeft -= pageHeight;
+  const exportBtn = document.getElementById('export-btn');
+  if (exportBtn) {
+    exportBtn.disabled = true;
+  }
+  showExportOverlay('正在导出PDF，请稍候...');
+  const pdf = new jspdf.jsPDF('p', 'mm', 'a4');
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const pxWidth = Math.max(target.scrollWidth, document.documentElement.scrollWidth);
+  const restoreButton = () => {
+    if (exportBtn) {
+      exportBtn.disabled = false;
     }
-    pdf.save('report.pdf');
-  });
+  };
+  let renderTask;
+  try {
+    renderTask = pdf.html(target, {
+      x: 8,
+      y: 12,
+      width: pageWidth - 16,
+      margin: [12, 12, 20, 12],
+      autoPaging: 'text',
+      windowWidth: pxWidth,
+      pagebreak: {
+        mode: ['css', 'legacy'],
+        avoid: ['.chapter > *', '.callout', '.chart-card', '.table-wrap', '.kpi-grid', '.hero-section']
+      },
+      html2canvas: {
+        scale: 0.72,
+        useCORS: true,
+        logging: false
+      },
+      callback: (doc) => doc.save('report.pdf')
+    });
+  } catch (err) {
+    console.error('PDF 导出失败', err);
+    updateExportOverlay('导出失败，请稍后重试');
+    hideExportOverlay(1200);
+    restoreButton();
+    alert('PDF导出失败，请稍后重试');
+    return;
+  }
+  if (renderTask && typeof renderTask.then === 'function') {
+    renderTask.then(() => {
+      updateExportOverlay('导出完成，正在保存...');
+      hideExportOverlay(800);
+      restoreButton();
+    }).catch(err => {
+      console.error('PDF 导出失败', err);
+      updateExportOverlay('导出失败，请稍后重试');
+      hideExportOverlay(1200);
+      restoreButton();
+      alert('PDF导出失败，请稍后重试');
+    });
+  } else {
+    hideExportOverlay();
+    restoreButton();
+  }
 }
 
 document.addEventListener('DOMContentLoaded', () => {

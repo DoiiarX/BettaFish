@@ -51,9 +51,37 @@ class TemplateSection:
         }
 
 
-heading_pattern = re.compile(r"^(#{1,6})\s+(.*)$")
-bullet_pattern = re.compile(r"^[-*+]\s+(.*)$")
-number_pattern = re.compile(r"^(?P<num>\d+(?:\.\d+)*)(?:[\s、:：.-]+(?P<label>.*))?$")
+# 解析表达式刻意避免使用 `.*`，以保持匹配的确定性，
+# 并规避不可信模板文本中常见的正则DoS风险。
+heading_pattern = re.compile(
+    r"""
+    (?P<marker>\#{1,6})       # Markdown标题标记
+    [ \t]+                    # 必需的空白字符
+    (?P<title>[^\r\n]+)       # 不包含换行的标题文本
+    """,
+    re.VERBOSE,
+)
+bullet_pattern = re.compile(
+    r"""
+    (?P<marker>[-*+])         # 列表项目符号
+    [ \t]+
+    (?P<title>[^\r\n]+)
+    """,
+    re.VERBOSE,
+)
+number_pattern = re.compile(
+    r"""
+    (?P<num>
+        (?:0|[1-9]\d*)
+        (?:\.(?:0|[1-9]\d*))*
+    )
+    (?:
+        (?:[ \t\u00A0\u3000、:：-]+|\.(?!\d))+
+        (?P<label>[^\r\n]*)
+    )?
+    """,
+    re.VERBOSE,
+)
 
 
 def parse_template_sections(template_md: str) -> List[TemplateSection]:
@@ -102,7 +130,7 @@ def parse_template_sections(template_md: str) -> List[TemplateSection]:
             order += SECTION_ORDER_STEP
             continue
 
-        # outline
+        # 提纲条目
         if current:
             current.outline.append(meta["title"])
 
@@ -128,10 +156,10 @@ def _classify_line(stripped: str, indent: int) -> Optional[dict]:
         dict | None: 识别后的元数据；无法识别时返回None。
     """
 
-    heading_match = heading_pattern.match(stripped)
+    heading_match = heading_pattern.fullmatch(stripped)
     if heading_match:
-        level = len(heading_match.group(1))
-        payload = _strip_markup(heading_match.group(2).strip())
+        level = len(heading_match.group("marker"))
+        payload = _strip_markup(heading_match.group("title").strip())
         title_info = _split_number(payload)
         slug = _build_slug(title_info["number"], title_info["title"])
         return {
@@ -143,9 +171,9 @@ def _classify_line(stripped: str, indent: int) -> Optional[dict]:
             "slug": slug,
         }
 
-    bullet_match = bullet_pattern.match(stripped)
+    bullet_match = bullet_pattern.fullmatch(stripped)
     if bullet_match:
-        payload = _strip_markup(bullet_match.group(1).strip())
+        payload = _strip_markup(bullet_match.group("title").strip())
         title_info = _split_number(payload)
         slug = _build_slug(title_info["number"], title_info["title"])
         is_section = indent <= 1
@@ -160,7 +188,7 @@ def _classify_line(stripped: str, indent: int) -> Optional[dict]:
         }
 
     # 兼容“1.1 ...”没有前缀符号的行
-    number_match = number_pattern.match(stripped)
+    number_match = number_pattern.fullmatch(stripped)
     if number_match and number_match.group("label"):
         payload = stripped
         title = number_match.group("label").strip()
@@ -201,7 +229,7 @@ def _split_number(payload: str) -> dict:
     返回:
         dict: 包含 number/title/display。
     """
-    match = number_pattern.match(payload)
+    match = number_pattern.fullmatch(payload)
     number = match.group("num") if match else ""
     label = match.group("label") if match else payload
     label = (label or "").strip()
