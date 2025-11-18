@@ -216,8 +216,17 @@ SYSTEM_PROMPT_TEMPLATE_SELECTION = f"""
 {json.dumps(output_schema_template_selection, indent=2, ensure_ascii=False)}
 </OUTPUT JSON SCHEMA>
 
-确保输出是一个符合上述输出JSON模式定义的JSON对象。
-只返回JSON对象，不要有解释或额外文本。
+**重要的输出格式要求：**
+1. 只返回符合上述Schema的纯JSON对象
+2. 严禁在JSON外添加任何思考过程、说明文字或解释
+3. 可以使用```json和```标记包裹JSON，但不要添加其他内容
+4. 确保JSON语法完全正确：
+   - 对象和数组元素之间必须有逗号分隔
+   - 字符串中的特殊字符必须正确转义（\n, \t, \"等）
+   - 括号必须成对且正确嵌套
+   - 不要使用尾随逗号（最后一个元素后不加逗号）
+   - 不要在JSON中添加注释
+5. 所有字符串值使用双引号，数值不使用引号
 """
 
 # HTML报告生成的系统提示词
@@ -360,19 +369,39 @@ SYSTEM_PROMPT_DOCUMENT_LAYOUT = f"""
 输入包含 templateOverview（模板标题+目录整体）、sections 列表以及多源报告，请先把模板标题和目录当成一个整体，与多引擎内容对照后设计标题与目录，再延伸出可直接渲染的视觉主题。你的输出会被独立存储以便后续拼接，请确保字段齐备。
 
 目标：
-1. 生成具有中文叙事风格的 title/subtitle/tagline，并确保可直接放在封面中央，文案中需自然提到“文章总览”；
+1. 生成具有中文叙事风格的 title/subtitle/tagline，并确保可直接放在封面中央，文案中需自然提到"文章总览"；
 2. 给出 hero：包含summary、highlights、actions、kpis（可含tone/delta），用于强调重点洞察与执行提示；
-3. 输出 tocPlan，一级目录固定用中文数字（“一、二、三”），二级目录用“1.1/1.2”，可在description里说明详略；如需定制目录标题，请填写 tocTitle；
+3. 输出 tocPlan，一级目录固定用中文数字（"一、二、三"），二级目录用"1.1/1.2"，可在description里说明详略；如需定制目录标题，请填写 tocTitle；
 4. 根据模板结构和素材密度，为 themeTokens / layoutNotes 提出字体、字号、留白建议（需特别强调目录、正文一级标题字号保持统一），如需色板或暗黑模式兼容也在此说明；
 5. 严禁要求外部图片或AI生图，推荐Chart.js图表、表格、色块、KPI卡等可直接渲染的原生组件；
 6. 不随意增删章节，仅优化命名或描述；若有排版或章节合并提示，请放入 layoutNotes，渲染层会严格遵循。
+
+**tocPlan的description字段特别要求：**
+- description字段必须是纯文本描述，用于在目录中展示章节简介
+- 严禁在description字段中嵌套JSON结构、对象、数组或任何特殊标记
+- description应该是简洁的一句话或一小段话，描述该章节的核心内容
+- 错误示例：{{"description": "描述内容，{{\"chapterId\": \"S3\"}}"}}
+- 正确示例：{{"description": "描述内容，详细分析章节要点"}}
+- 如果需要关联chapterId，请使用tocPlan对象的chapterId字段，不要写在description中
 
 输出必须满足下述JSON Schema：
 <OUTPUT JSON SCHEMA>
 {json.dumps(document_layout_output_schema, ensure_ascii=False, indent=2)}
 </OUTPUT JSON SCHEMA>
 
-只返回JSON，勿附加额外文本。
+**重要的输出格式要求：**
+1. 只返回符合上述Schema的纯JSON对象
+2. 严禁在JSON外添加任何思考过程、说明文字或解释
+3. 可以使用```json和```标记包裹JSON，但不要添加其他内容
+4. 确保JSON语法完全正确：
+   - 对象和数组元素之间必须有逗号分隔
+   - 字符串中的特殊字符必须正确转义（\n, \t, \"等）
+   - 括号必须成对且正确嵌套
+   - 不要使用尾随逗号（最后一个元素后不加逗号）
+   - 不要在JSON中添加注释
+   - description等文本字段中不得包含JSON结构
+5. 所有字符串值使用双引号，数值不使用引号
+6. 再次强调：tocPlan中每个条目的description必须是纯文本，不能包含任何JSON片段
 """
 
 # 篇幅规划提示词
@@ -390,7 +419,17 @@ SYSTEM_PROMPT_WORD_BUDGET = f"""
 {json.dumps(word_budget_output_schema, ensure_ascii=False, indent=2)}
 </OUTPUT JSON SCHEMA>
 
-只返回JSON，无额外说明。
+**重要的输出格式要求：**
+1. 只返回符合上述Schema的纯JSON对象
+2. 严禁在JSON外添加任何思考过程、说明文字或解释
+3. 可以使用```json和```标记包裹JSON，但不要添加其他内容
+4. 确保JSON语法完全正确：
+   - 对象和数组元素之间必须有逗号分隔
+   - 字符串中的特殊字符必须正确转义（\n, \t, \"等）
+   - 括号必须成对且正确嵌套
+   - 不要使用尾随逗号（最后一个元素后不加逗号）
+   - 不要在JSON中添加注释
+5. 所有字符串值使用双引号，数值不使用引号
 """
 
 

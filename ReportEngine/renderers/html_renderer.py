@@ -8,7 +8,20 @@ import ast
 import copy
 import html
 import json
+import os
+import re
+import base64
+from pathlib import Path
 from typing import Any, Dict, List
+from loguru import logger
+
+from ReportEngine.utils.chart_validator import (
+    ChartValidator,
+    ChartRepairer,
+    create_chart_validator,
+    create_chart_repairer
+)
+from ReportEngine.utils.chart_repair_api import create_llm_repair_functions
 
 
 class HTMLRenderer:
@@ -61,6 +74,77 @@ class HTMLRenderer:
         self.secondary_heading_index = 0
         self.toc_rendered = False
         self.hero_kpi_signature: tuple | None = None
+        self._lib_cache: Dict[str, str] = {}
+        self._pdf_font_base64: str | None = None
+
+        # 初始化图表验证和修复器
+        self.chart_validator = create_chart_validator()
+        llm_repair_fns = create_llm_repair_functions()
+        self.chart_repairer = create_chart_repairer(
+            validator=self.chart_validator,
+            llm_repair_fns=llm_repair_fns
+        )
+
+        # 统计信息
+        self.chart_validation_stats = {
+            'total': 0,
+            'valid': 0,
+            'repaired_locally': 0,
+            'repaired_api': 0,
+            'failed': 0
+        }
+
+    @staticmethod
+    def _get_lib_path() -> Path:
+        """获取第三方库文件的目录路径"""
+        return Path(__file__).parent / "libs"
+
+    @staticmethod
+    def _get_font_path() -> Path:
+        """返回PDF导出所需字体的路径"""
+        return Path(__file__).parent / "assets" / "fonts" / "SourceHanSerifSC-Medium.otf"
+
+    def _load_lib(self, filename: str) -> str:
+        """
+        加载指定的第三方库文件内容
+
+        参数:
+            filename: 库文件名
+
+        返回:
+            str: 库文件的JavaScript代码内容
+        """
+        if filename in self._lib_cache:
+            return self._lib_cache[filename]
+
+        lib_path = self._get_lib_path() / filename
+        try:
+            with open(lib_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                self._lib_cache[filename] = content
+                return content
+        except FileNotFoundError:
+            print(f"警告: 库文件 {filename} 未找到，将使用CDN备用链接")
+            return ""
+        except Exception as e:
+            print(f"警告: 读取库文件 {filename} 时出错: {e}")
+            return ""
+
+    def _load_pdf_font_data(self) -> str:
+        """加载PDF字体的Base64数据，避免重复读取大型文件"""
+        if self._pdf_font_base64 is not None:
+            return self._pdf_font_base64
+        font_path = self._get_font_path()
+        try:
+            data = font_path.read_bytes()
+            self._pdf_font_base64 = base64.b64encode(data).decode("ascii")
+            return self._pdf_font_base64
+        except FileNotFoundError:
+            logger.warning("PDF字体文件缺失：%s", font_path)
+        except Exception as exc:
+            logger.warning("读取PDF字体文件失败：%s (%s)", font_path, exc)
+        self._pdf_font_base64 = ""
+        return self._pdf_font_base64
 
     # ====== 公共入口 ======
 
@@ -90,6 +174,15 @@ class HTMLRenderer:
         self.heading_label_map = self._compute_heading_labels(self.chapters)
         self.toc_entries = self._collect_toc_entries(self.chapters)
 
+        # 重置图表验证统计
+        self.chart_validation_stats = {
+            'total': 0,
+            'valid': 0,
+            'repaired_locally': 0,
+            'repaired_api': 0,
+            'failed': 0
+        }
+
         metadata = self.metadata
         theme_tokens = metadata.get("themeTokens") or self.document.get("themeTokens", {})
         title = metadata.get("title") or metadata.get("query") or "智能舆情报告"
@@ -98,6 +191,10 @@ class HTMLRenderer:
 
         head = self._render_head(title, theme_tokens)
         body = self._render_body()
+
+        # 输出图表验证统计
+        self._log_chart_validation_stats()
+
         return f"<!DOCTYPE html>\n<html lang=\"zh-CN\" class=\"no-js\">\n{head}\n{body}\n</html>"
 
     # ====== 头部 / 正文 ======
@@ -147,16 +244,33 @@ class HTMLRenderer:
             str: head片段HTML。
         """
         css = self._build_css(theme_tokens)
+        pdf_font_b64 = self._load_pdf_font_data()
+        pdf_font_literal = json.dumps(pdf_font_b64)
+
+        # 加载第三方库
+        chartjs = self._load_lib("chart.js")
+        chartjs_sankey = self._load_lib("chartjs-chart-sankey.js")
+        html2canvas = self._load_lib("html2canvas.min.js")
+        jspdf = self._load_lib("jspdf.umd.min.js")
+        mathjax = self._load_lib("mathjax.js")
+
+        # 如果库文件加载失败，使用CDN备用链接
+        chartjs_tag = f"<script>{chartjs}</script>" if chartjs else '<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>'
+        sankey_tag = f"<script>{chartjs_sankey}</script>" if chartjs_sankey else '<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-sankey@4"></script>'
+        html2canvas_tag = f"<script>{html2canvas}</script>" if html2canvas else '<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>'
+        jspdf_tag = f"<script>{jspdf}</script>" if jspdf else '<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>'
+        mathjax_tag = f"<script defer>{mathjax}</script>" if mathjax else '<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>'
+
         return f"""
 <head>
   <meta charset="utf-8" />
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{self._escape_html(title)}</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-sankey@4"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  {chartjs_tag}
+  {sankey_tag}
+  {html2canvas_tag}
+  {jspdf_tag}
   <script>
     window.MathJax = {{
       tex: {{
@@ -169,10 +283,14 @@ class HTMLRenderer:
       }}
     }};
   </script>
-  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  {mathjax_tag}
   <style>
 {css}
   </style>
+  <script>
+    // 预载 PDF 字体 Base64 数据，后续由 jspdf addFileToVFS 使用
+    window.pdfFontData = {pdf_font_literal};
+  </script>
   <script>
     document.documentElement.classList.remove('no-js');
     document.documentElement.classList.add('js-ready');
@@ -241,7 +359,7 @@ class HTMLRenderer:
   <div class="header-actions">
     <button id="theme-toggle" class="action-btn" type="button">🌗 主题切换</button>
     <button id="print-btn" class="action-btn" type="button">🖨️ 打印</button>
-    <!-- <button id="export-btn" class="action-btn" type="button">⬇️ 导出PDF</button> -->
+    <button id="export-btn" class="action-btn" type="button">⬇️ 导出PDF</button>
   </div>
 </header>
 """.strip()
@@ -363,23 +481,44 @@ class HTMLRenderer:
             chapters: Document IR中的章节数组。
 
         返回:
-            list[dict]: 规范化后的目录条目，包含level/text/anchor。
+            list[dict]: 规范化后的目录条目，包含level/text/anchor/description。
         """
         metadata = self.metadata
         toc_config = metadata.get("toc") or {}
         custom_entries = toc_config.get("customEntries")
         entries: List[Dict[str, Any]] = []
+
         if custom_entries:
             for entry in custom_entries:
                 anchor = entry.get("anchor") or self.chapter_anchor_map.get(entry.get("chapterId"))
+
+                # 验证anchor是否有效
                 if not anchor:
+                    logger.warning(
+                        f"目录项 '{entry.get('display') or entry.get('title')}' "
+                        f"缺少有效的anchor，已跳过"
+                    )
                     continue
+
+                # 验证anchor是否在chapter_anchor_map中或在chapters的blocks中
+                anchor_valid = self._validate_toc_anchor(anchor, chapters)
+                if not anchor_valid:
+                    logger.warning(
+                        f"目录项 '{entry.get('display') or entry.get('title')}' "
+                        f"的anchor '{anchor}' 在文档中未找到对应的章节"
+                    )
+
+                # 清理描述文本
+                description = entry.get("description")
+                if description:
+                    description = self._clean_text_from_json_artifacts(description)
+
                 entries.append(
                     {
                         "level": entry.get("level", 2),
                         "text": entry.get("display") or entry.get("title") or "",
                         "anchor": anchor,
-                        "description": entry.get("description"),
+                        "description": description,
                     }
                 )
             return entries
@@ -391,15 +530,51 @@ class HTMLRenderer:
                     if not anchor:
                         continue
                     mapped = self.heading_label_map.get(anchor, {})
+                    # 清理描述文本
+                    description = mapped.get("description")
+                    if description:
+                        description = self._clean_text_from_json_artifacts(description)
                     entries.append(
                         {
                             "level": block.get("level", 2),
                             "text": mapped.get("display") or block.get("text", ""),
                             "anchor": anchor,
-                            "description": mapped.get("description"),
+                            "description": description,
                         }
                     )
         return entries
+
+    def _validate_toc_anchor(self, anchor: str, chapters: List[Dict[str, Any]]) -> bool:
+        """
+        验证目录anchor是否在文档中存在对应的章节或heading。
+
+        参数:
+            anchor: 需要验证的anchor
+            chapters: Document IR中的章节数组
+
+        返回:
+            bool: anchor是否有效
+        """
+        # 检查是否是章节anchor
+        if anchor in self.chapter_anchor_map.values():
+            return True
+
+        # 检查是否在heading_label_map中
+        if anchor in self.heading_label_map:
+            return True
+
+        # 检查章节的blocks中是否有这个anchor
+        for chapter in chapters or []:
+            chapter_anchor = chapter.get("anchor")
+            if chapter_anchor == anchor:
+                return True
+
+            for block in chapter.get("blocks", []):
+                block_anchor = block.get("anchor")
+                if block_anchor == anchor:
+                    return True
+
+        return False
 
     def _prepare_chapters(self, chapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """复制章节并展开其中序列化的block，避免渲染缺失"""
@@ -552,6 +727,9 @@ class HTMLRenderer:
             str: `<li>` 形式的HTML。
         """
         desc = entry.get("description")
+        # 清理描述文本中的JSON片段
+        if desc:
+            desc = self._clean_text_from_json_artifacts(desc)
         desc_html = f'<p class="toc-desc">{self._escape_html(desc)}</p>' if desc else ""
         level = entry.get("level", 2)
         css_level = 1 if level <= 2 else min(level, 4)
@@ -1101,12 +1279,66 @@ class HTMLRenderer:
         """
         渲染Chart.js等交互组件的占位容器，并记录配置JSON。
 
+        在渲染前进行图表验证和修复：
+        1. 验证图表数据格式
+        2. 如果无效，尝试本地修复
+        3. 如果本地修复失败，尝试API修复
+        4. 如果所有修复都失败，使用原始数据（前端会降级处理）
+
         参数:
             block: widget类型的block，包含widgetId/props/data。
 
         返回:
             str: 含canvas与配置脚本的HTML。
         """
+        # 统计
+        widget_type = block.get('widgetType', '')
+        is_chart = isinstance(widget_type, str) and widget_type.startswith('chart.js')
+
+        if is_chart:
+            self.chart_validation_stats['total'] += 1
+
+            # 验证图表数据
+            validation_result = self.chart_validator.validate(block)
+
+            if not validation_result.is_valid:
+                logger.warning(
+                    f"图表 {block.get('widgetId', 'unknown')} 验证失败: {validation_result.errors}"
+                )
+
+                # 尝试修复
+                repair_result = self.chart_repairer.repair(block, validation_result)
+
+                if repair_result.success and repair_result.repaired_block:
+                    # 修复成功，使用修复后的数据
+                    block = repair_result.repaired_block
+                    logger.info(
+                        f"图表 {block.get('widgetId', 'unknown')} 修复成功 "
+                        f"(方法: {repair_result.method}): {repair_result.changes}"
+                    )
+
+                    # 更新统计
+                    if repair_result.method == 'local':
+                        self.chart_validation_stats['repaired_locally'] += 1
+                    elif repair_result.method == 'api':
+                        self.chart_validation_stats['repaired_api'] += 1
+                else:
+                    # 修复失败，使用原始数据，前端会尝试降级渲染
+                    logger.warning(
+                        f"图表 {block.get('widgetId', 'unknown')} 修复失败，"
+                        f"将使用原始数据（前端会尝试降级渲染或显示fallback）"
+                    )
+                    self.chart_validation_stats['failed'] += 1
+            else:
+                # 验证通过
+                self.chart_validation_stats['valid'] += 1
+                if validation_result.warnings:
+                    logger.info(
+                        f"图表 {block.get('widgetId', 'unknown')} 验证通过，"
+                        f"但有警告: {validation_result.warnings}"
+                    )
+
+        # 渲染图表HTML
         self.chart_counter += 1
         canvas_id = f"chart-{self.chart_counter}"
         config_id = f"chart-config-{self.chart_counter}"
@@ -1170,6 +1402,39 @@ class HTMLRenderer:
         </div>
         """
         return table_html
+
+    def _log_chart_validation_stats(self):
+        """输出图表验证统计信息"""
+        stats = self.chart_validation_stats
+        if stats['total'] == 0:
+            return
+
+        logger.info("=" * 60)
+        logger.info("图表验证统计")
+        logger.info("=" * 60)
+        logger.info(f"总图表数量: {stats['total']}")
+        logger.info(f"  ✓ 验证通过: {stats['valid']} ({stats['valid']/stats['total']*100:.1f}%)")
+
+        if stats['repaired_locally'] > 0:
+            logger.info(
+                f"  ⚠ 本地修复: {stats['repaired_locally']} "
+                f"({stats['repaired_locally']/stats['total']*100:.1f}%)"
+            )
+
+        if stats['repaired_api'] > 0:
+            logger.info(
+                f"  ⚠ API修复: {stats['repaired_api']} "
+                f"({stats['repaired_api']/stats['total']*100:.1f}%)"
+            )
+
+        if stats['failed'] > 0:
+            logger.warning(
+                f"  ✗ 修复失败: {stats['failed']} "
+                f"({stats['failed']/stats['total']*100:.1f}%) - "
+                f"这些图表将使用降级渲染或显示fallback表格"
+            )
+
+        logger.info("=" * 60)
 
     # ====== 前置信息防护 ======
 
@@ -1401,6 +1666,64 @@ class HTMLRenderer:
 
     # ====== 文本 / 安全工具 ======
 
+    def _clean_text_from_json_artifacts(self, text: Any) -> str:
+        """
+        清理文本中的JSON片段和伪造的结构标记。
+
+        LLM有时会在文本字段中混入未完成的JSON片段，如：
+        "描述文本，{ \"chapterId\": \"S3" 或 "描述文本，{ \"level\": 2"
+
+        此方法会：
+        1. 移除不完整的JSON对象（以 { 开头但未正确闭合的）
+        2. 移除不完整的JSON数组（以 [ 开头但未正确闭合的）
+        3. 移除孤立的JSON键值对片段
+
+        参数:
+            text: 可能包含JSON片段的文本
+
+        返回:
+            str: 清理后的纯文本
+        """
+        if not text:
+            return ""
+
+        text_str = self._safe_text(text)
+
+        # 模式1: 移除以逗号+空白+{开头的不完整JSON对象
+        # 例如: "文本，{ \"key\": \"value\"" 或 "文本，{\\n  \"key\""
+        text_str = re.sub(r',\s*\{[^}]*$', '', text_str)
+
+        # 模式2: 移除以逗号+空白+[开头的不完整JSON数组
+        text_str = re.sub(r',\s*\[[^\]]*$', '', text_str)
+
+        # 模式3: 移除孤立的 { 加上后续内容（如果没有匹配的 }）
+        # 检查是否有未闭合的 {
+        open_brace_pos = text_str.rfind('{')
+        if open_brace_pos != -1:
+            close_brace_pos = text_str.rfind('}')
+            if close_brace_pos < open_brace_pos:
+                # { 在 } 后面或没有 }，说明是未闭合的
+                # 截断到 { 之前
+                text_str = text_str[:open_brace_pos].rstrip(',，、 \t\n')
+
+        # 模式4: 类似处理 [
+        open_bracket_pos = text_str.rfind('[')
+        if open_bracket_pos != -1:
+            close_bracket_pos = text_str.rfind(']')
+            if close_bracket_pos < open_bracket_pos:
+                # [ 在 ] 后面或没有 ]，说明是未闭合的
+                text_str = text_str[:open_bracket_pos].rstrip(',，、 \t\n')
+
+        # 模式5: 移除看起来像JSON键值对的片段，如 "chapterId": "S3
+        # 这种情况通常出现在上面的模式之后
+        text_str = re.sub(r',?\s*"[^"]+"\s*:\s*"[^"]*$', '', text_str)
+        text_str = re.sub(r',?\s*"[^"]+"\s*:\s*[^,}\]]*$', '', text_str)
+
+        # 清理末尾的逗号和空白
+        text_str = text_str.rstrip(',，、 \t\n')
+
+        return text_str.strip()
+
     def _safe_text(self, value: Any) -> str:
         """将任意值安全转换为字符串，None与复杂对象容错"""
         if value is None:
@@ -1427,10 +1750,28 @@ class HTMLRenderer:
 
     def _build_css(self, tokens: Dict[str, Any]) -> str:
         """根据主题token拼接整页CSS，包括响应式与打印样式"""
-        colors = tokens.get("colors") or {}
-        typography = tokens.get("typography") or {}
-        fonts = tokens.get("fonts") or typography.get("fontFamily") or {}
-        spacing = tokens.get("spacing") or {}
+        # 安全获取各个配置项，确保都是字典类型
+        colors_raw = tokens.get("colors")
+        colors = colors_raw if isinstance(colors_raw, dict) else {}
+
+        typography_raw = tokens.get("typography")
+        typography = typography_raw if isinstance(typography_raw, dict) else {}
+
+        # 安全获取fonts，确保是字典类型
+        fonts_raw = tokens.get("fonts") or typography.get("fonts")
+        if isinstance(fonts_raw, dict):
+            fonts = fonts_raw
+        else:
+            # 如果fonts是字符串或None，构造一个字典
+            font_family = typography.get("fontFamily")
+            if isinstance(font_family, str):
+                fonts = {"body": font_family, "heading": font_family}
+            else:
+                fonts = {}
+
+        spacing_raw = tokens.get("spacing")
+        spacing = spacing_raw if isinstance(spacing_raw, dict) else {}
+
         primary_palette = self._resolve_color_family(
             colors.get("primary"),
             {"main": "#1a365d", "light": "#2d3748", "dark": "#0f1a2d"},
@@ -1721,6 +2062,12 @@ body.exporting {{
   margin: 0;
   font-size: 1rem;
 }}
+.exporting *,
+.exporting *::before,
+.exporting *::after {{
+  animation: none !important;
+  transition: none !important;
+}}
 .export-progress {{
   width: 220px;
   height: 6px;
@@ -1779,6 +2126,10 @@ p {{
 ul, ol {{
   margin-left: 1.5em;
   padding-left: 0;
+}}
+img, canvas, svg {{
+  max-width: 100%;
+  height: auto;
 }}
 .meta-card {{
   background: rgba(0,0,0,0.02);
@@ -2003,21 +2354,38 @@ pre.code-block {{
   }}
   .chapter > *,
   .hero-section,
-  .callout,
-  .chart-card,
-  .kpi-grid,
-  .table-wrap,
-  figure,
-  blockquote {{
-    break-inside: avoid;
-    page-break-inside: avoid;
-  }}
-  .chapter h2,
-  .chapter h3,
-  .chapter h4 {{
-    break-after: avoid;
-    page-break-after: avoid;
-  }}
+.callout,
+.chart-card,
+.kpi-grid,
+.table-wrap,
+figure,
+blockquote {{
+  break-inside: avoid;
+  page-break-inside: avoid;
+}}
+.chapter h2,
+.chapter h3,
+.chapter h4 {{
+  break-after: avoid;
+  page-break-after: avoid;
+  break-inside: avoid;
+}}
+.chart-card,
+.table-wrap {{
+  overflow: visible !important;
+}}
+.chart-card canvas {{
+  width: 100% !important;
+  height: auto !important;
+}}
+.table-wrap table {{
+  table-layout: fixed;
+  width: 100%;
+}}
+.table-wrap table th,
+.table-wrap table td {{
+  word-break: break-word;
+}}
 }}
 """
 
@@ -2268,6 +2636,80 @@ function buildChartOptions(payload) {
   return mergeOptions(baseOptions, overrideOptions);
 }
 
+function validateChartData(payload, type) {
+  /**
+   * 前端验证图表数据
+   * 返回: { valid: boolean, errors: string[] }
+   */
+  const errors = [];
+
+  if (!payload || typeof payload !== 'object') {
+    errors.push('无效的payload');
+    return { valid: false, errors };
+  }
+
+  const data = payload.data;
+  if (!data || typeof data !== 'object') {
+    errors.push('缺少data字段');
+    return { valid: false, errors };
+  }
+
+  // 特殊图表类型（scatter, bubble）
+  const specialTypes = { 'scatter': true, 'bubble': true };
+  if (specialTypes[type]) {
+    // 这些类型需要特殊的数据格式 {x, y} 或 {x, y, r}
+    // 跳过标准验证
+    return { valid: true, errors };
+  }
+
+  // 标准图表类型验证
+  const datasets = data.datasets;
+  if (!Array.isArray(datasets)) {
+    errors.push('datasets必须是数组');
+    return { valid: false, errors };
+  }
+
+  if (datasets.length === 0) {
+    errors.push('datasets数组为空');
+    return { valid: false, errors };
+  }
+
+  // 验证每个dataset
+  for (let i = 0; i < datasets.length; i++) {
+    const dataset = datasets[i];
+    if (!dataset || typeof dataset !== 'object') {
+      errors.push(`datasets[${i}]不是对象`);
+      continue;
+    }
+
+    if (!Array.isArray(dataset.data)) {
+      errors.push(`datasets[${i}].data不是数组`);
+    } else if (dataset.data.length === 0) {
+      errors.push(`datasets[${i}].data为空`);
+    }
+  }
+
+  // 需要labels的图表类型
+  const labelRequiredTypes = {
+    'line': true, 'bar': true, 'radar': true,
+    'polarArea': true, 'pie': true, 'doughnut': true
+  };
+
+  if (labelRequiredTypes[type]) {
+    const labels = data.labels;
+    if (!Array.isArray(labels)) {
+      errors.push('缺少labels数组');
+    } else if (labels.length === 0) {
+      errors.push('labels数组为空');
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+}
+
 function instantiateChart(ctx, payload, optionsTemplate, type) {
   if (!ctx) {
     return null;
@@ -2309,9 +2751,17 @@ function hydrateCharts() {
       renderChartFallback(canvas, payload, 'Canvas 初始化失败');
       return;
     }
+
+    // 前端数据验证
+    const desiredType = chartTypes[0];
+    const validation = validateChartData(payload, desiredType);
+    if (!validation.valid) {
+      console.warn('图表数据验证失败:', validation.errors);
+      // 验证失败但仍然尝试渲染，因为可能会降级成功
+    }
+
     const card = canvas.closest('.chart-card') || canvas.parentElement;
     const optionsTemplate = buildChartOptions(payload);
-    const desiredType = chartTypes[0];
     let chartInstance = null;
     let selectedType = null;
     let lastError;
@@ -2398,16 +2848,37 @@ function exportPdf() {
     exportBtn.disabled = true;
   }
   showExportOverlay('正在导出PDF，请稍候...');
+  document.body.classList.add('exporting');
   const pdf = new jspdf.jsPDF('p', 'mm', 'a4');
+  try {
+    if (window.pdfFontData) {
+      pdf.addFileToVFS('SourceHanSerifSC-Medium.otf', window.pdfFontData);
+      pdf.addFont('SourceHanSerifSC-Medium.otf', 'SourceHanSerif', 'normal');
+      pdf.setFont('SourceHanSerif');
+    }
+  } catch (err) {
+    console.warn('Custom PDF font setup failed, fallback to default', err);
+  }
   const pageWidth = pdf.internal.pageSize.getWidth();
-  const pxWidth = Math.max(target.scrollWidth, document.documentElement.scrollWidth);
+  const pxWidth = Math.max(
+    target.scrollWidth,
+    document.documentElement.scrollWidth,
+    Math.round(pageWidth * 3.78)
+  );
   const restoreButton = () => {
     if (exportBtn) {
       exportBtn.disabled = false;
     }
+    document.body.classList.remove('exporting');
   };
   let renderTask;
   try {
+    // force charts to rerender at full width before capture
+    chartRegistry.forEach(chart => {
+      if (chart && typeof chart.resize === 'function') {
+        chart.resize();
+      }
+    });
     renderTask = pdf.html(target, {
       x: 8,
       y: 12,
@@ -2415,14 +2886,24 @@ function exportPdf() {
       margin: [12, 12, 20, 12],
       autoPaging: 'text',
       windowWidth: pxWidth,
+      html2canvas: {
+        scale: Math.min(1.2, Math.max(0.8, pageWidth / (target.clientWidth || pageWidth))),
+        useCORS: true,
+        scrollX: 0,
+        scrollY: -window.scrollY,
+        logging: false
+      },
       pagebreak: {
         mode: ['css', 'legacy'],
-        avoid: ['.chapter > *', '.callout', '.chart-card', '.table-wrap', '.kpi-grid', '.hero-section']
-      },
-      html2canvas: {
-        scale: 0.72,
-        useCORS: true,
-        logging: false
+        avoid: [
+          '.chapter > *',
+          '.callout',
+          '.chart-card',
+          '.table-wrap',
+          '.kpi-grid',
+          '.hero-section'
+        ],
+        before: '.chapter-divider'
       },
       callback: (doc) => doc.save('report.pdf')
     });
