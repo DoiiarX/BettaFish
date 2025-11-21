@@ -233,13 +233,54 @@ class ReportAgent:
         - 确保日志目录存在；
         - 使用独立的 loguru sink 写入 Report Engine 专属 log 文件，
           避免与其他子系统混淆。
+        - 【修复】配置实时日志写入，禁用缓冲，确保前端实时看到日志
+        - 【修复】防止重复添加handler
         """
         # 确保日志目录存在
         log_dir = os.path.dirname(self.config.LOG_FILE)
         os.makedirs(log_dir, exist_ok=True)
-        
-        # 创建专用的logger，避免与其他模块冲突
-        logger.add(self.config.LOG_FILE, level="INFO")
+
+        # 【修复】检查是否已经添加过这个文件的handler，避免重复
+        # loguru会自动去重，但显式检查更安全
+        log_file_path = str(Path(self.config.LOG_FILE).resolve())
+
+        # 检查现有的handlers
+        handler_exists = False
+        for handler_id, handler_config in logger._core.handlers.items():
+            if hasattr(handler_config, 'sink'):
+                sink = handler_config.sink
+                # 检查是否是文件sink且路径相同
+                if hasattr(sink, '_name') and sink._name == log_file_path:
+                    handler_exists = True
+                    logger.debug(f"日志handler已存在，跳过添加: {log_file_path}")
+                    break
+
+        if not handler_exists:
+            # 【修复】创建专用的logger，配置实时写入
+            # - enqueue=False: 禁用异步队列，立即写入
+            # - buffering=1: 行缓冲，每条日志立即刷新到文件
+            # - level="DEBUG": 记录所有级别的日志
+            # - encoding="utf-8": 明确指定UTF-8编码
+            # - mode="a": 追加模式，保留历史日志
+            handler_id = logger.add(
+                self.config.LOG_FILE,
+                level="DEBUG",
+                enqueue=False,      # 禁用异步队列，同步写入
+                buffering=1,        # 行缓冲，每行立即写入
+                serialize=False,    # 普通文本格式，不序列化为JSON
+                encoding="utf-8",   # 明确UTF-8编码
+                mode="a"            # 追加模式
+            )
+            logger.debug(f"已添加日志handler (ID: {handler_id}): {self.config.LOG_FILE}")
+
+        # 【修复】验证日志文件可写
+        try:
+            with open(self.config.LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write('')  # 尝试写入空字符串验证权限
+                f.flush()    # 立即刷新
+        except Exception as e:
+            logger.error(f"日志文件无法写入: {self.config.LOG_FILE}, 错误: {e}")
+            raise
         
     def _initialize_file_baseline(self):
         """
@@ -386,6 +427,7 @@ class ReportAgent:
                 'template': template_result.get('template_name'),
                 'reason': template_result.get('selection_reason')
             })
+            emit('progress', {'progress': 10, 'message': '模板选择完成'})
             sections = self._slice_template(template_result.get('template_content', ''))
             if not sections:
                 raise ValueError("模板无法解析出章节，请检查模板内容。")
@@ -407,6 +449,7 @@ class ReportAgent:
                 'title': layout_design.get('title'),
                 'toc': layout_design.get('tocTitle')
             })
+            emit('progress', {'progress': 15, 'message': '文档标题/目录设计完成'})
             # 使用刚生成的设计稿对全书进行篇幅规划，约束各章字数与重点
             word_plan = self.word_budget_node.run(
                 sections,
@@ -420,6 +463,7 @@ class ReportAgent:
                 'stage': 'word_plan_ready',
                 'chapter_targets': len(word_plan.get('chapters', []))
             })
+            emit('progress', {'progress': 20, 'message': '章节字数规划已生成'})
             # 记录每个章节的目标字数/强调点，后续传给章节LLM
             chapter_targets = {
                 entry.get("chapterId"): entry
@@ -472,6 +516,9 @@ class ReportAgent:
             chapter_max_attempts = max(
                 self._CONTENT_SPARSE_MIN_ATTEMPTS, self.config.CHAPTER_JSON_MAX_ATTEMPTS
             )
+            total_chapters = len(sections)  # 总章节数
+            completed_chapters = 0  # 已完成章节数
+
             for section in sections:
                 logger.info(f"生成章节: {section.title}")
                 emit('chapter_status', {
@@ -587,6 +634,13 @@ class ReportAgent:
                         f"{section.title} 章节JSON在 {chapter_max_attempts} 次尝试后仍无法解析"
                     )
                 chapters.append(chapter_payload)
+                completed_chapters += 1  # 更新已完成章节数
+                # 计算当前进度：20% + 80% * (已完成章节数 / 总章节数)，四舍五入
+                chapter_progress = 20 + round(80 * completed_chapters / total_chapters)
+                emit('progress', {
+                    'progress': chapter_progress,
+                    'message': f'章节 {completed_chapters}/{total_chapters} 已完成'
+                })
                 completion_status = {
                     'chapterId': section.chapter_id,
                     'title': section.title,

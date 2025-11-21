@@ -1,0 +1,737 @@
+"""
+PDF渲染器 - 使用WeasyPrint从HTML生成PDF
+支持完整的CSS样式和中文字体
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict
+from datetime import datetime
+from loguru import logger
+
+# 在导入WeasyPrint之前，尝试补充常见的macOS Homebrew动态库路径，
+# 避免因未设置DYLD_LIBRARY_PATH而找不到pango/cairo等依赖。
+if sys.platform == 'darwin':
+    brew_lib = Path('/opt/homebrew/lib')
+    if brew_lib.exists():
+        current = os.environ.get('DYLD_LIBRARY_PATH', '')
+        if str(brew_lib) not in current.split(':'):
+            os.environ['DYLD_LIBRARY_PATH'] = f"{brew_lib}{':' + current if current else ''}"
+
+try:
+    from weasyprint import HTML, CSS
+    from weasyprint.text.fonts import FontConfiguration
+    WEASYPRINT_AVAILABLE = True
+except (ImportError, OSError) as e:
+    WEASYPRINT_AVAILABLE = False
+    # 判断错误类型以提供更友好的提示
+    if isinstance(e, OSError):
+        logger.warning(
+            "PDF 导出依赖缺失（系统库未安装或环境变量未设置），"
+            "PDF 导出功能将不可用。其他功能不受影响。"
+        )
+    else:
+        logger.warning("WeasyPrint未安装，PDF导出功能将不可用")
+except Exception as e:
+    WEASYPRINT_AVAILABLE = False
+    logger.warning(f"WeasyPrint 加载失败: {e}，PDF导出功能将不可用")
+
+from .html_renderer import HTMLRenderer
+from .pdf_layout_optimizer import PDFLayoutOptimizer, PDFLayoutConfig
+from .chart_to_svg import create_chart_converter
+from .math_to_svg import MathToSVG
+
+
+class PDFRenderer:
+    """
+    基于WeasyPrint的PDF渲染器
+
+    - 直接从HTML生成PDF，保留所有CSS样式
+    - 完美支持中文字体
+    - 自动处理分页和布局
+    """
+
+    def __init__(
+        self,
+        config: Dict[str, Any] | None = None,
+        layout_optimizer: PDFLayoutOptimizer | None = None
+    ):
+        """
+        初始化PDF渲染器
+
+        参数:
+            config: 渲染器配置
+            layout_optimizer: PDF布局优化器（可选）
+        """
+        self.config = config or {}
+        self.html_renderer = HTMLRenderer(config)
+        self.layout_optimizer = layout_optimizer or PDFLayoutOptimizer()
+
+        if not WEASYPRINT_AVAILABLE:
+            raise RuntimeError("WeasyPrint未安装，请运行: pip install weasyprint")
+
+        # 初始化图表转换器
+        try:
+            font_path = self._get_font_path()
+            self.chart_converter = create_chart_converter(font_path=str(font_path))
+            logger.info("图表SVG转换器初始化成功")
+        except Exception as e:
+            logger.warning(f"图表SVG转换器初始化失败: {e}，将使用表格降级")
+
+        # 初始化数学公式转换器
+        try:
+            self.math_converter = MathToSVG(font_size=16, color='black')
+            logger.info("数学公式SVG转换器初始化成功")
+        except Exception as e:
+            logger.warning(f"数学公式SVG转换器初始化失败: {e}，公式将显示为文本")
+            self.math_converter = None
+
+    @staticmethod
+    def _get_font_path() -> Path:
+        """获取字体文件路径"""
+        # 优先使用完整字体以确保字符覆盖
+        fonts_dir = Path(__file__).parent / "assets" / "fonts"
+
+        # 检查完整字体
+        full_font = fonts_dir / "SourceHanSerifSC-Medium.otf"
+        if full_font.exists():
+            logger.info(f"使用完整字体: {full_font}")
+            return full_font
+
+        # 检查TTF子集字体
+        subset_ttf = fonts_dir / "SourceHanSerifSC-Medium-Subset.ttf"
+        if subset_ttf.exists():
+            logger.info(f"使用TTF子集字体: {subset_ttf}")
+            return subset_ttf
+
+        # 检查OTF子集字体
+        subset_otf = fonts_dir / "SourceHanSerifSC-Medium-Subset.otf"
+        if subset_otf.exists():
+            logger.info(f"使用OTF子集字体: {subset_otf}")
+            return subset_otf
+
+        raise FileNotFoundError(f"未找到字体文件，请检查 {fonts_dir} 目录")
+
+    def _preprocess_charts(self, document_ir: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        预处理图表：验证和修复所有图表数据
+
+        这个方法确保在转换为SVG之前，所有图表数据都是有效的。
+        使用与HTMLRenderer相同的验证和修复逻辑，保证PDF和HTML的一致性。
+
+        参数:
+            document_ir: Document IR数据
+
+        返回:
+            Dict[str, Any]: 修复后的Document IR（深拷贝）
+        """
+        # 深拷贝以避免修改原始IR
+        ir_copy = copy.deepcopy(document_ir)
+
+        repair_stats = {
+            'total': 0,
+            'repaired': 0,
+            'failed': 0
+        }
+
+        def repair_widgets_in_blocks(blocks: list, chapter_context: Dict[str, Any] | None = None) -> None:
+            """递归修复blocks中的所有widget"""
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+
+                # 处理widget类型
+                if block.get('type') == 'widget':
+                    # 先用HTML渲染器的容错逻辑补全字段
+                    try:
+                        self.html_renderer._normalize_chart_block(block, chapter_context)
+                    except Exception as exc:  # 防御性处理，避免单个图表阻断流程
+                        logger.debug(f"预处理图表 {block.get('widgetId')} 时出错: {exc}")
+
+                    widget_type = block.get('widgetType', '')
+                    if widget_type.startswith('chart.js'):
+                        repair_stats['total'] += 1
+
+                        # 使用HTMLRenderer的验证器和修复器
+                        validation = self.html_renderer.chart_validator.validate(block)
+
+                        if not validation.is_valid:
+                            logger.debug(f"图表 {block.get('widgetId')} 需要修复: {validation.errors}")
+
+                            # 尝试修复
+                            repair_result = self.html_renderer.chart_repairer.repair(block, validation)
+
+                            if repair_result.success and repair_result.repaired_block:
+                                # 更新block内容（在副本中）
+                                block.update(repair_result.repaired_block)
+                                repair_stats['repaired'] += 1
+                                logger.debug(
+                                    f"图表 {block.get('widgetId')} 已修复 "
+                                    f"(方法: {repair_result.method})"
+                                )
+                            else:
+                                repair_stats['failed'] += 1
+                                logger.warning(
+                                    f"图表 {block.get('widgetId')} 修复失败，将使用原始数据"
+                                )
+
+                # 递归处理嵌套的blocks
+            nested_blocks = block.get('blocks')
+            if isinstance(nested_blocks, list):
+                repair_widgets_in_blocks(nested_blocks, chapter_context)
+
+                # 处理列表项
+            if block.get('type') == 'list':
+                items = block.get('items', [])
+                for item in items:
+                    if isinstance(item, list):
+                        repair_widgets_in_blocks(item, chapter_context)
+
+                # 处理表格单元格
+            if block.get('type') == 'table':
+                rows = block.get('rows', [])
+                for row in rows:
+                    cells = row.get('cells', [])
+                    for cell in cells:
+                        cell_blocks = cell.get('blocks', [])
+                        if isinstance(cell_blocks, list):
+                            repair_widgets_in_blocks(cell_blocks, chapter_context)
+
+        # 处理所有章节
+        chapters = ir_copy.get('chapters', [])
+        for chapter in chapters:
+            blocks = chapter.get('blocks', [])
+            repair_widgets_in_blocks(blocks, chapter)
+
+        # 输出统计信息
+        if repair_stats['total'] > 0:
+            logger.info(
+                f"PDF图表预处理完成: "
+                f"总计 {repair_stats['total']} 个图表, "
+                f"修复 {repair_stats['repaired']} 个, "
+                f"失败 {repair_stats['failed']} 个"
+            )
+
+        return ir_copy
+
+    def _convert_charts_to_svg(self, document_ir: Dict[str, Any]) -> Dict[str, str]:
+        """
+        将document_ir中的所有图表转换为SVG
+
+        参数:
+            document_ir: Document IR数据
+
+        返回:
+            Dict[str, str]: widgetId到SVG字符串的映射
+        """
+        svg_map = {}
+
+        if not hasattr(self, 'chart_converter') or not self.chart_converter:
+            logger.warning("图表转换器未初始化，跳过图表转换")
+            return svg_map
+
+        # 遍历所有章节
+        chapters = document_ir.get('chapters', [])
+        for chapter in chapters:
+            blocks = chapter.get('blocks', [])
+            self._extract_and_convert_widgets(blocks, svg_map)
+
+        logger.info(f"成功转换 {len(svg_map)} 个图表为SVG")
+        return svg_map
+
+    def _extract_and_convert_widgets(
+        self,
+        blocks: list,
+        svg_map: Dict[str, str]
+    ) -> None:
+        """
+        递归遍历blocks，找到所有widget并转换为SVG
+
+        参数:
+            blocks: block列表
+            svg_map: 用于存储转换结果的字典
+        """
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+
+            block_type = block.get('type')
+
+            # 处理widget类型
+            if block_type == 'widget':
+                widget_id = block.get('widgetId')
+                widget_type = block.get('widgetType', '')
+
+                # 只处理chart.js类型的widget
+                if widget_id and widget_type.startswith('chart.js'):
+                    try:
+                        svg_content = self.chart_converter.convert_widget_to_svg(
+                            block,
+                            width=800,
+                            height=500,
+                            dpi=100
+                        )
+                        if svg_content:
+                            svg_map[widget_id] = svg_content
+                            logger.debug(f"图表 {widget_id} 转换为SVG成功")
+                        else:
+                            logger.warning(f"图表 {widget_id} 转换为SVG失败")
+                    except Exception as e:
+                        logger.error(f"转换图表 {widget_id} 时出错: {e}")
+
+            # 递归处理嵌套的blocks
+            nested_blocks = block.get('blocks')
+            if isinstance(nested_blocks, list):
+                self._extract_and_convert_widgets(nested_blocks, svg_map)
+
+            # 处理列表项
+            if block_type == 'list':
+                items = block.get('items', [])
+                for item in items:
+                    if isinstance(item, list):
+                        self._extract_and_convert_widgets(item, svg_map)
+
+            # 处理表格单元格
+            if block_type == 'table':
+                rows = block.get('rows', [])
+                for row in rows:
+                    cells = row.get('cells', [])
+                    for cell in cells:
+                        cell_blocks = cell.get('blocks', [])
+                        if isinstance(cell_blocks, list):
+                            self._extract_and_convert_widgets(cell_blocks, svg_map)
+
+    def _convert_math_to_svg(self, document_ir: Dict[str, Any]) -> Dict[str, str]:
+        """
+        将document_ir中的所有数学公式转换为SVG
+
+        参数:
+            document_ir: Document IR数据
+
+        返回:
+            Dict[str, str]: 公式块ID到SVG字符串的映射
+        """
+        svg_map = {}
+
+        if not hasattr(self, 'math_converter') or not self.math_converter:
+            logger.warning("数学公式转换器未初始化，跳过公式转换")
+            return svg_map
+
+        # 遍历所有章节
+        chapters = document_ir.get('chapters', [])
+        for chapter in chapters:
+            blocks = chapter.get('blocks', [])
+            self._extract_and_convert_math_blocks(blocks, svg_map)
+
+        logger.info(f"成功转换 {len(svg_map)} 个数学公式为SVG")
+        return svg_map
+
+    def _extract_and_convert_math_blocks(
+        self,
+        blocks: list,
+        svg_map: Dict[str, str],
+        block_counter: list = None
+    ) -> None:
+        """
+        递归遍历blocks，找到所有math块并转换为SVG
+
+        参数:
+            blocks: block列表
+            svg_map: 用于存储转换结果的字典
+            block_counter: 用于生成唯一ID的计数器
+        """
+        if block_counter is None:
+            block_counter = [0]
+
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+
+            block_type = block.get('type')
+
+            # 处理math类型
+            if block_type == 'math':
+                latex = block.get('latex', '').strip()
+                if latex:
+                    block_counter[0] += 1
+                    math_id = f"math-block-{block_counter[0]}"
+
+                    try:
+                        svg_content = self.math_converter.convert_display_to_svg(latex)
+                        if svg_content:
+                            svg_map[math_id] = svg_content
+                            # 将ID添加到block中，以便后续注入时识别
+                            block['mathId'] = math_id
+                            logger.debug(f"公式 {math_id} 转换为SVG成功")
+                        else:
+                            logger.warning(f"公式 {math_id} 转换为SVG失败: {latex[:50]}...")
+                    except Exception as e:
+                        logger.error(f"转换公式 {latex[:50]}... 时出错: {e}")
+
+            # 递归处理嵌套的blocks
+            nested_blocks = block.get('blocks')
+            if isinstance(nested_blocks, list):
+                self._extract_and_convert_math_blocks(nested_blocks, svg_map, block_counter)
+
+            # 处理列表项
+            if block_type == 'list':
+                items = block.get('items', [])
+                for item in items:
+                    if isinstance(item, list):
+                        self._extract_and_convert_math_blocks(item, svg_map, block_counter)
+
+            # 处理表格单元格
+            if block_type == 'table':
+                rows = block.get('rows', [])
+                for row in rows:
+                    cells = row.get('cells', [])
+                    for cell in cells:
+                        cell_blocks = cell.get('blocks', [])
+                        if isinstance(cell_blocks, list):
+                            self._extract_and_convert_math_blocks(cell_blocks, svg_map, block_counter)
+
+            # 处理callout内部的blocks
+            if block_type == 'callout':
+                callout_blocks = block.get('blocks', [])
+                if isinstance(callout_blocks, list):
+                    self._extract_and_convert_math_blocks(callout_blocks, svg_map, block_counter)
+
+    def _inject_svg_into_html(self, html: str, svg_map: Dict[str, str]) -> str:
+        """
+        将SVG内容直接注入到HTML中（不使用JavaScript）
+
+        参数:
+            html: 原始HTML内容
+            svg_map: widgetId到SVG内容的映射
+
+        返回:
+            str: 注入SVG后的HTML
+        """
+        if not svg_map:
+            return html
+
+        import re
+
+        # 为每个widgetId查找对应的canvas并替换为SVG
+        for widget_id, svg_content in svg_map.items():
+            # 清理SVG内容（移除XML声明，因为SVG将嵌入HTML）
+            svg_content = re.sub(r'<\?xml[^>]+\?>', '', svg_content)
+            svg_content = re.sub(r'<!DOCTYPE[^>]+>', '', svg_content)
+            svg_content = svg_content.strip()
+
+            # 创建SVG容器HTML
+            svg_html = f'<div class="chart-svg-container">{svg_content}</div>'
+
+            # 查找包含此widgetId的配置脚本
+            # 格式: <script type="application/json" id="chart-config-N">{"widgetId":"widget_id",...}</script>
+            config_pattern = rf'<script[^>]+id="([^"]+)"[^>]*>\s*\{{[^}}]*"widgetId"\s*:\s*"{re.escape(widget_id)}"[^}}]*\}}'
+            match = re.search(config_pattern, html, re.DOTALL)
+
+            if match:
+                config_id = match.group(1)
+
+                # 查找对应的canvas元素
+                # 格式: <canvas id="chart-N" data-config-id="chart-config-N"></canvas>
+                canvas_pattern = rf'<canvas[^>]+data-config-id="{re.escape(config_id)}"[^>]*></canvas>'
+
+                # 【修复】替换canvas为SVG，使用lambda避免反斜杠转义问题
+                html = re.sub(canvas_pattern, lambda m: svg_html, html)
+                logger.debug(f"已替换图表 {widget_id} 的canvas为SVG")
+
+                # 将对应fallback标记为隐藏，避免PDF中出现重复表格
+                fallback_pattern = rf'<div class="chart-fallback"([^>]*data-widget-id="{re.escape(widget_id)}"[^>]*)>'
+
+                def _hide_fallback(m: re.Match) -> str:
+                    tag = m.group(0)
+                    if 'svg-hidden' in tag:
+                        return tag
+                    return tag.replace('chart-fallback"', 'chart-fallback svg-hidden"', 1)
+
+                html = re.sub(fallback_pattern, _hide_fallback, html, count=1)
+            else:
+                logger.warning(f"未找到图表 {widget_id} 对应的配置脚本")
+
+        return html
+
+    def _inject_math_svg_into_html(self, html: str, svg_map: Dict[str, str]) -> str:
+        """
+        将数学公式SVG内容注入到HTML中
+
+        参数:
+            html: 原始HTML内容
+            svg_map: 公式ID到SVG内容的映射
+
+        返回:
+            str: 注入SVG后的HTML
+        """
+        if not svg_map:
+            return html
+
+        import re
+
+        # 为每个math block查找对应的div并替换为SVG
+        for math_id, svg_content in svg_map.items():
+            # 清理SVG内容（移除XML声明，因为SVG将嵌入HTML）
+            svg_content = re.sub(r'<\?xml[^>]+\?>', '', svg_content)
+            svg_content = re.sub(r'<!DOCTYPE[^>]+>', '', svg_content)
+            svg_content = svg_content.strip()
+
+            # 创建SVG容器HTML
+            svg_html = f'<div class="math-svg-container">{svg_content}</div>'
+
+            # 查找对应的math-block div
+            # 格式: <div class="math-block">$$ latex $$</div>
+            # 我们需要找到包含特定LaTeX内容的div
+            # 但由于我们在转换时已经给block添加了mathId，我们可以用另一种方式
+
+            # 方案：在HTML渲染器中为math-block添加data-math-id属性
+            # 但这需要修改HTMLRenderer，暂时我们使用更简单的方法：
+            # 按顺序替换所有math-block
+
+            # 暂时使用简单的替换方案
+            # 找到第一个math-block div并替换
+            math_block_pattern = r'<div class="math-block">\$\$[^$]*\$\$</div>'
+            # 【修复】使用lambda函数避免re.sub将SVG内容中的反斜杠解释为转义序列
+            # lambda函数中的返回值会被当作字面字符串，不会进行转义处理
+            html = re.sub(math_block_pattern, lambda m: svg_html, html, count=1)
+            logger.debug(f"已替换公式 {math_id} 为SVG")
+
+        return html
+
+    def _get_pdf_html(
+        self,
+        document_ir: Dict[str, Any],
+        optimize_layout: bool = True
+    ) -> str:
+        """
+        生成适用于PDF的HTML内容
+
+        - 移除交互式元素（按钮、导航等）
+        - 添加PDF专用样式
+        - 嵌入字体文件
+        - 应用布局优化
+        - 将图表转换为SVG矢量图形
+
+        参数:
+            document_ir: Document IR数据
+            optimize_layout: 是否启用布局优化
+
+        返回:
+            str: 优化后的HTML内容
+        """
+        # 如果启用布局优化，先分析文档并生成优化配置
+        if optimize_layout:
+            logger.info("启用PDF布局优化...")
+            layout_config = self.layout_optimizer.optimize_for_document(document_ir)
+
+            # 保存优化日志
+            log_dir = Path('logs/pdf_layouts')
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / f"layout_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+            # 保存配置和优化日志
+            optimization_log = self.layout_optimizer._log_optimization(
+                self.layout_optimizer._analyze_document(document_ir),
+                layout_config
+            )
+            self.layout_optimizer.config = layout_config
+            self.layout_optimizer.save_config(log_file, optimization_log)
+        else:
+            layout_config = self.layout_optimizer.config
+
+        # 关键修复：先预处理图表，确保数据有效
+        logger.info("预处理图表数据...")
+        preprocessed_ir = self._preprocess_charts(document_ir)
+
+        # 转换图表为SVG（使用预处理后的IR）
+        logger.info("开始转换图表为SVG矢量图形...")
+        svg_map = self._convert_charts_to_svg(preprocessed_ir)
+
+        # 转换数学公式为SVG
+        logger.info("开始转换数学公式为SVG矢量图形...")
+        math_svg_map = self._convert_math_to_svg(preprocessed_ir)
+
+        # 使用HTML渲染器生成基础HTML（使用原始IR，因为HTMLRenderer会自己修复）
+        # 注意：这里仍使用原始document_ir，因为HTMLRenderer内部会进行相同的修复
+        # 这确保了HTML和SVG使用相同的修复逻辑
+        html = self.html_renderer.render(document_ir)
+
+        # 注入图表SVG
+        if svg_map:
+            html = self._inject_svg_into_html(html, svg_map)
+            logger.info(f"已注入 {len(svg_map)} 个SVG图表")
+
+        # 注入数学公式SVG
+        if math_svg_map:
+            html = self._inject_math_svg_into_html(html, math_svg_map)
+            logger.info(f"已注入 {len(math_svg_map)} 个SVG公式")
+
+        # 获取字体路径并转换为base64（用于嵌入）
+        font_path = self._get_font_path()
+        font_data = font_path.read_bytes()
+        font_base64 = base64.b64encode(font_data).decode('ascii')
+
+        # 判断字体格式
+        font_format = 'opentype' if font_path.suffix == '.otf' else 'truetype'
+
+        # 生成优化后的CSS
+        optimized_css = self.layout_optimizer.generate_pdf_css()
+
+        # 添加PDF专用CSS
+        pdf_css = f"""
+<style>
+/* PDF专用字体嵌入 */
+@font-face {{
+    font-family: 'SourceHanSerif';
+    src: url(data:font/{font_format};base64,{font_base64}) format('{font_format}');
+    font-weight: normal;
+    font-style: normal;
+}}
+
+/* 强制所有文本使用思源宋体 */
+body, h1, h2, h3, h4, h5, h6, p, li, td, th, div, span {{
+    font-family: 'SourceHanSerif', serif !important;
+}}
+
+/* PDF专用样式调整 */
+.report-header {{
+    display: none !important;
+}}
+
+.no-print {{
+    display: none !important;
+}}
+
+body {{
+    background: white !important;
+}}
+
+/* SVG图表容器样式 */
+.chart-svg-container {{
+    width: 100%;
+    height: auto;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}}
+
+.chart-svg-container svg {{
+    max-width: 100%;
+    height: auto;
+}}
+
+/* 数学公式SVG容器样式 */
+.math-svg-container {{
+    width: 100%;
+    height: auto;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin: 20px 0;
+}}
+
+.math-svg-container svg {{
+    max-width: 100%;
+    height: auto;
+}}
+
+/* 隐藏原始的math-block（因为已被SVG替换） */
+.math-block {{
+    display: none !important;
+}}
+
+/* 当对应SVG成功注入时隐藏fallback表格，失败时继续显示兜底数据 */
+.chart-fallback.svg-hidden {{
+    display: none !important;
+}}
+
+/* 确保chart-container显示（用于放置SVG） */
+.chart-container {{
+    display: block !important;
+    min-height: 400px;
+}}
+
+{optimized_css}
+</style>
+"""
+
+        # 在</head>前插入PDF专用CSS
+        html = html.replace('</head>', f'{pdf_css}\n</head>')
+
+        return html
+
+    def render_to_pdf(
+        self,
+        document_ir: Dict[str, Any],
+        output_path: str | Path,
+        optimize_layout: bool = True
+    ) -> Path:
+        """
+        将Document IR渲染为PDF文件
+
+        参数:
+            document_ir: Document IR数据
+            output_path: PDF输出路径
+            optimize_layout: 是否启用布局优化（默认True）
+
+        返回:
+            Path: 生成的PDF文件路径
+        """
+        output_path = Path(output_path)
+
+        logger.info(f"开始生成PDF: {output_path}")
+
+        # 生成HTML内容
+        html_content = self._get_pdf_html(document_ir, optimize_layout)
+
+        # 配置字体
+        font_config = FontConfiguration()
+
+        # 从HTML字符串创建WeasyPrint HTML对象
+        html_doc = HTML(string=html_content, base_url=str(Path.cwd()))
+
+        # 生成PDF
+        try:
+            html_doc.write_pdf(
+                output_path,
+                font_config=font_config,
+                presentational_hints=True  # 保留HTML的呈现提示
+            )
+            logger.info(f"✓ PDF生成成功: {output_path}")
+            return output_path
+
+        except Exception as e:
+            logger.error(f"PDF生成失败: {e}")
+            raise
+
+    def render_to_bytes(
+        self,
+        document_ir: Dict[str, Any],
+        optimize_layout: bool = True
+    ) -> bytes:
+        """
+        将Document IR渲染为PDF字节流
+
+        参数:
+            document_ir: Document IR数据
+            optimize_layout: 是否启用布局优化（默认True）
+
+        返回:
+            bytes: PDF文件的字节内容
+        """
+        html_content = self._get_pdf_html(document_ir, optimize_layout)
+        font_config = FontConfiguration()
+        html_doc = HTML(string=html_content, base_url=str(Path.cwd()))
+
+        return html_doc.write_pdf(
+            font_config=font_config,
+            presentational_hints=True
+        )
+
+
+__all__ = ["PDFRenderer"]

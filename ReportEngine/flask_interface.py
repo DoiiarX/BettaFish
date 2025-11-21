@@ -37,6 +37,57 @@ STREAM_HEARTBEAT_INTERVAL = 15  # 心跳间隔秒
 stream_lock = threading.Lock()
 stream_subscribers = defaultdict(list)
 tasks_registry: Dict[str, 'ReportTask'] = {}
+LOG_STREAM_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+log_stream_handler_id: Optional[int] = None
+
+
+def _stream_log_to_task(message):
+    """
+    将loguru日志同步到当前任务的SSE事件，保证前端实时可见。
+
+    仅在存在运行中的任务时推送，避免无关日志刷屏。
+    """
+    try:
+        record = message.record
+        level_name = record["level"].name
+        if level_name not in LOG_STREAM_LEVELS:
+            return
+
+        with task_lock:
+            task = current_task
+
+        if not task or task.status not in ("running", "pending"):
+            return
+
+        timestamp = record["time"].strftime("%H:%M:%S.%f")[:-3]
+        formatted_line = f"[{timestamp}] [{level_name}] {record['message']}"
+        task.publish_event(
+            "log",
+            {
+                "line": formatted_line,
+                "level": level_name.lower(),
+                "timestamp": timestamp,
+                "message": record["message"],
+                "module": record.get("module", ""),
+                "function": record.get("function", ""),
+            },
+        )
+    except Exception:
+        # 避免在日志钩子里产生日志递归
+        pass
+
+
+def _setup_log_stream_forwarder():
+    """为当前进程挂载一次性的loguru钩子，用于SSE实时转发。"""
+    global log_stream_handler_id
+    if log_stream_handler_id is not None:
+        return
+    log_stream_handler_id = logger.add(
+        _stream_log_to_task,
+        level="DEBUG",
+        enqueue=False,
+        catch=True,
+    )
 
 
 def _register_stream(task_id: str) -> Queue:
@@ -160,6 +211,15 @@ def initialize_report_engine():
     try:
         report_agent = create_agent()
         logger.info("Report Engine初始化成功")
+        _setup_log_stream_forwarder()
+
+        # 检测 PDF 生成依赖（Pango）
+        try:
+            from .utils.dependency_check import log_dependency_status
+            log_dependency_status()
+        except Exception as dep_err:
+            logger.warning(f"依赖检测失败: {dep_err}")
+
         return True
     except Exception as e:
         logger.exception(f"Report Engine初始化失败: {str(e)}")
@@ -198,6 +258,8 @@ class ReportTask:
         self.report_file_name = ""
         self.state_file_path = ""
         self.state_file_relative_path = ""
+        self.ir_file_path = ""
+        self.ir_file_relative_path = ""
         # ====== 流式事件缓存与并发保护 ======
         # 使用deque保存最近的事件，结合锁保证多线程下的安全访问
         self.event_history: deque = deque(maxlen=1000)
@@ -248,7 +310,9 @@ class ReportTask:
             'report_file_name': self.report_file_name,
             'report_file_path': self.report_file_relative_path or self.report_file_path,
             'state_file_ready': bool(self.state_file_path),
-            'state_file_path': self.state_file_relative_path or self.state_file_path
+            'state_file_path': self.state_file_relative_path or self.state_file_path,
+            'ir_file_ready': bool(self.ir_file_path),
+            'ir_file_path': self.ir_file_relative_path or self.ir_file_path
         }
 
     def publish_event(self, event_type: str, payload: Dict[str, Any]) -> None:
@@ -337,8 +401,11 @@ def run_report_generation(task: ReportTask, query: str, custom_template: str = "
         def stream_handler(event_type: str, payload: Dict[str, Any]):
             """所有阶段事件都通过同一个接口分发，保证日志一致。"""
             task.publish_event(event_type, payload)
+            # 如果事件包含进度信息，同步更新任务进度
+            if event_type == 'progress' and 'progress' in payload:
+                task.update_status("running", payload['progress'])
 
-        task.update_status("running", 10)
+        task.update_status("running", 5)
         task.publish_event('stage', {'message': '任务已启动，正在检查输入文件', 'stage': 'prepare'})
 
         # 检查输入文件
@@ -353,13 +420,9 @@ def run_report_generation(task: ReportTask, query: str, custom_template: str = "
             'files': check_result.get('latest_files', {})
         })
 
-        task.update_status("running", 30)
-
         # 加载输入文件
         content = report_agent.load_input_files(check_result['latest_files'])
         task.publish_event('stage', {'message': '源数据加载完成，启动生成流程', 'stage': 'data_loaded'})
-
-        task.update_status("running", 50)
 
         # 生成报告（附带兜底重试，缓解瞬时网络抖动）
         for attempt in range(1, 3):
@@ -420,7 +483,6 @@ def run_report_generation(task: ReportTask, query: str, custom_template: str = "
         else:
             html_report = generation_result
 
-        task.update_status("running", 90)
         task.publish_event('stage', {'message': '报告生成完毕，准备持久化', 'stage': 'persist'})
 
         # 保存结果
@@ -431,6 +493,8 @@ def run_report_generation(task: ReportTask, query: str, custom_template: str = "
             task.report_file_name = generation_result.get('report_filename', '')
             task.state_file_path = generation_result.get('state_filepath', '')
             task.state_file_relative_path = generation_result.get('state_relative_path', '')
+            task.ir_file_path = generation_result.get('ir_filepath', '')
+            task.ir_file_relative_path = generation_result.get('ir_relative_path', '')
         task.publish_event('html_ready', {
             'message': 'HTML渲染完成，可刷新预览',
             'report_file': task.report_file_relative_path or task.report_file_path,
@@ -945,9 +1009,22 @@ def clear_report_log():
     """
     try:
         log_file = settings.LOG_FILE
-        with open(log_file, 'w', encoding='utf-8') as f:
-            f.write('')
+
+        # 【修复】使用truncate而非重新打开，避免与logger的文件句柄冲突
+        # 追加模式打开，然后truncate，保持文件句柄有效
+        with open(log_file, 'r+', encoding='utf-8') as f:
+            f.truncate(0)  # 清空文件内容但不关闭文件
+            f.flush()      # 立即刷新
+
         logger.info(f"已清空日志文件: {log_file}")
+    except FileNotFoundError:
+        # 文件不存在，创建空文件
+        try:
+            with open(log_file, 'w', encoding='utf-8') as f:
+                f.write('')
+            logger.info(f"创建日志文件: {log_file}")
+        except Exception as e:
+            logger.exception(f"创建日志文件失败: {str(e)}")
     except Exception as e:
         logger.exception(f"清空日志文件失败: {str(e)}")
 
@@ -957,29 +1034,58 @@ def get_report_log():
     """
     获取report.log内容，并按行去除空白返回。
 
+    【修复】优化大文件读取，添加错误处理和文件锁
+
     返回:
         Response: JSON，包含最新日志行数组。
     """
     try:
         log_file = settings.LOG_FILE
-        
+
         if not os.path.exists(log_file):
             return jsonify({
                 'success': True,
                 'log_lines': []
             })
-        
-        with open(log_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        
-        # 清理行尾的换行符
+
+        # 【修复】检查文件大小，避免读取过大文件导致内存问题
+        file_size = os.path.getsize(log_file)
+        max_size = 10 * 1024 * 1024  # 10MB限制
+
+        if file_size > max_size:
+            # 文件过大，只读取最后10MB
+            with open(log_file, 'rb') as f:
+                f.seek(-max_size, 2)  # 从文件末尾往前10MB
+                # 跳过可能不完整的第一行
+                f.readline()
+                content = f.read().decode('utf-8', errors='replace')
+            lines = content.splitlines()
+            logger.warning(f"日志文件过大 ({file_size} bytes)，仅返回最后 {max_size} bytes")
+        else:
+            # 正常大小，完整读取
+            with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+        # 清理行尾的换行符和空行
         log_lines = [line.rstrip('\n\r') for line in lines if line.strip()]
-        
+
         return jsonify({
             'success': True,
             'log_lines': log_lines
         })
-        
+
+    except PermissionError as e:
+        logger.error(f"读取日志权限不足: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': '读取日志权限不足'
+        }), 403
+    except UnicodeDecodeError as e:
+        logger.error(f"日志文件编码错误: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': '日志文件编码错误'
+        }), 500
     except Exception as e:
         logger.exception(f"读取日志失败: {str(e)}")
         return jsonify({
@@ -1007,4 +1113,164 @@ def clear_log():
         return jsonify({
             'success': False,
             'error': f'清空日志失败: {str(e)}'
+        }), 500
+
+
+@report_bp.route('/export/pdf/<task_id>', methods=['GET'])
+def export_pdf(task_id: str):
+    """
+    导出报告为PDF格式。
+
+    从IR JSON文件生成优化的PDF，支持自动布局调整。
+
+    参数:
+        task_id: 任务ID
+
+    查询参数:
+        optimize: 是否启用布局优化（默认true）
+
+    返回:
+        Response: PDF文件流或错误信息
+    """
+    try:
+        # 检测 Pango 依赖
+        from .utils.dependency_check import check_pango_available
+        pango_available, pango_message = check_pango_available()
+        if not pango_available:
+            return jsonify({
+                'success': False,
+                'error': 'PDF 导出功能不可用：缺少系统依赖',
+                'details': '请查看根目录 README.md 第393行「PDF 导出依赖」部分了解如何安装依赖',
+                'help_url': 'https://github.com/666ghj/BettaFish#3-安装-pdf-导出所需系统依赖可选',
+                'system_message': pango_message
+            }), 503
+
+        # 获取任务信息
+        task = tasks_registry.get(task_id)
+        if not task:
+            return jsonify({
+                'success': False,
+                'error': '任务不存在'
+            }), 404
+
+        # 检查任务是否完成
+        if task.status != 'completed':
+            return jsonify({
+                'success': False,
+                'error': f'任务未完成，当前状态: {task.status}'
+            }), 400
+
+        # 获取IR文件路径
+        if not task.ir_file_path or not os.path.exists(task.ir_file_path):
+            return jsonify({
+                'success': False,
+                'error': 'IR文件不存在'
+            }), 404
+
+        # 读取IR数据
+        with open(task.ir_file_path, 'r', encoding='utf-8') as f:
+            document_ir = json.load(f)
+
+        # 检查是否启用布局优化
+        optimize = request.args.get('optimize', 'true').lower() == 'true'
+
+        # 创建PDF渲染器并生成PDF
+        from .renderers import PDFRenderer
+        renderer = PDFRenderer()
+
+        logger.info(f"开始导出PDF，任务ID: {task_id}，布局优化: {optimize}")
+
+        # 生成PDF字节流
+        pdf_bytes = renderer.render_to_bytes(document_ir, optimize_layout=optimize)
+
+        # 确定下载文件名
+        topic = document_ir.get('metadata', {}).get('topic', 'report')
+        pdf_filename = f"report_{topic}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+
+        # 返回PDF文件
+        return Response(
+            pdf_bytes,
+            mimetype='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="{pdf_filename}"',
+                'Content-Type': 'application/pdf'
+            }
+        )
+
+    except Exception as e:
+        logger.exception(f"导出PDF失败: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'导出PDF失败: {str(e)}'
+        }), 500
+
+
+@report_bp.route('/export/pdf-from-ir', methods=['POST'])
+def export_pdf_from_ir():
+    """
+    从IR JSON直接导出PDF（不需要任务ID）。
+
+    适用于前端直接传递IR数据的场景。
+
+    请求体:
+        {
+            "document_ir": {...},  // Document IR JSON
+            "optimize": true       // 是否启用布局优化（可选）
+        }
+
+    返回:
+        Response: PDF文件流或错误信息
+    """
+    try:
+        # 检测 Pango 依赖
+        from .utils.dependency_check import check_pango_available
+        pango_available, pango_message = check_pango_available()
+        if not pango_available:
+            return jsonify({
+                'success': False,
+                'error': 'PDF 导出功能不可用：缺少系统依赖',
+                'details': '请查看根目录 README.md 第393行「PDF 导出依赖」部分了解如何安装依赖',
+                'help_url': 'https://github.com/666ghj/BettaFish#3-安装-pdf-导出所需系统依赖可选',
+                'system_message': pango_message
+            }), 503
+
+        data = request.get_json()
+
+        if not data or 'document_ir' not in data:
+            return jsonify({
+                'success': False,
+                'error': '缺少document_ir参数'
+            }), 400
+
+        document_ir = data['document_ir']
+        optimize = data.get('optimize', True)
+
+        # 创建PDF渲染器并生成PDF
+        from .renderers import PDFRenderer
+        renderer = PDFRenderer()
+
+        logger.info(f"从IR直接导出PDF，布局优化: {optimize}")
+
+        # 生成PDF字节流
+        pdf_bytes = renderer.render_to_bytes(document_ir, optimize_layout=optimize)
+
+        # 确定下载文件名
+        topic = document_ir.get('metadata', {}).get('topic', 'report')
+        pdf_filename = f"report_{topic}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+
+        # 返回PDF文件
+        return Response(
+            pdf_bytes,
+            mimetype='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="{pdf_filename}"',
+                'Content-Type': 'application/pdf'
+            }
+        )
+
+    except Exception as e:
+        logger.exception(f"从IR导出PDF失败: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': f'导出PDF失败: {str(e)}'
         }), 500

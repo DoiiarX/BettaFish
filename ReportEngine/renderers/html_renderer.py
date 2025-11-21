@@ -1,5 +1,10 @@
 """
 基于章节IR的HTML/PDF渲染器，实现与示例报告一致的交互与视觉。
+
+新增要点：
+1. 内置Chart.js数据验证/修复（ChartValidator+LLM兜底），杜绝非法配置导致的注入或崩溃；
+2. 将MathJax/Chart.js/html2canvas/jspdf等依赖内联并带CDN fallback，适配离线或被墙环境；
+3. 预置思源宋体子集的Base64字体，用于PDF/HTML一体化导出，避免缺字或额外系统依赖。
 """
 
 from __future__ import annotations
@@ -74,6 +79,7 @@ class HTMLRenderer:
         self.secondary_heading_index = 0
         self.toc_rendered = False
         self.hero_kpi_signature: tuple | None = None
+        self._current_chapter: Dict[str, Any] | None = None
         self._lib_cache: Dict[str, str] = {}
         self._pdf_font_base64: str | None = None
 
@@ -101,8 +107,8 @@ class HTMLRenderer:
 
     @staticmethod
     def _get_font_path() -> Path:
-        """返回PDF导出所需字体的路径"""
-        return Path(__file__).parent / "assets" / "fonts" / "SourceHanSerifSC-Medium.otf"
+        """返回PDF导出所需字体的路径（使用优化后的子集字体）"""
+        return Path(__file__).parent / "assets" / "fonts" / "SourceHanSerifSC-Medium-Subset.ttf"
 
     def _load_lib(self, filename: str) -> str:
         """
@@ -145,6 +151,78 @@ class HTMLRenderer:
             logger.warning("读取PDF字体文件失败：%s (%s)", font_path, exc)
         self._pdf_font_base64 = ""
         return self._pdf_font_base64
+
+    def _build_script_with_fallback(
+        self,
+        inline_code: str,
+        cdn_url: str,
+        check_expression: str,
+        lib_name: str,
+        is_defer: bool = False
+    ) -> str:
+        """
+        构建带有CDN fallback机制的script标签
+
+        策略：
+        1. 优先嵌入本地库代码
+        2. 添加检测脚本，验证库是否成功加载
+        3. 如果检测失败，动态加载CDN版本作为备用
+
+        参数:
+            inline_code: 本地库的JavaScript代码内容
+            cdn_url: CDN备用链接
+            check_expression: JavaScript表达式，用于检测库是否加载成功
+            lib_name: 库名称（用于日志输出）
+            is_defer: 是否使用defer属性
+
+        返回:
+            str: 完整的script标签HTML
+        """
+        defer_attr = ' defer' if is_defer else ''
+
+        if inline_code:
+            # 嵌入本地库代码，并添加fallback检测
+            return f"""
+  <script{defer_attr}>
+    // {lib_name} - 嵌入式版本
+    try {{
+      {inline_code}
+    }} catch (e) {{
+      console.error('{lib_name}嵌入式加载失败:', e);
+    }}
+  </script>
+  <script{defer_attr}>
+    // {lib_name} - CDN Fallback检测
+    (function() {{
+      var checkLib = function() {{
+        if (!({check_expression})) {{
+          console.warn('{lib_name}本地版本加载失败，正在从CDN加载备用版本...');
+          var script = document.createElement('script');
+          script.src = '{cdn_url}';
+          script.onerror = function() {{
+            console.error('{lib_name} CDN备用加载也失败了');
+          }};
+          script.onload = function() {{
+            console.log('{lib_name} CDN备用版本加载成功');
+          }};
+          document.head.appendChild(script);
+        }}
+      }};
+
+      // 延迟检测，确保嵌入代码有时间执行
+      if (document.readyState === 'loading') {{
+        document.addEventListener('DOMContentLoaded', function() {{
+          setTimeout(checkLib, 100);
+        }});
+      }} else {{
+        setTimeout(checkLib, 100);
+      }}
+    }})();
+  </script>""".strip()
+        else:
+            # 本地文件读取失败，直接使用CDN
+            logger.warning(f"{lib_name}本地文件未找到或读取失败，将直接使用CDN")
+            return f'  <script{defer_attr} src="{cdn_url}"></script>'
 
     # ====== 公共入口 ======
 
@@ -244,8 +322,6 @@ class HTMLRenderer:
             str: head片段HTML。
         """
         css = self._build_css(theme_tokens)
-        pdf_font_b64 = self._load_pdf_font_data()
-        pdf_font_literal = json.dumps(pdf_font_b64)
 
         # 加载第三方库
         chartjs = self._load_lib("chart.js")
@@ -254,12 +330,50 @@ class HTMLRenderer:
         jspdf = self._load_lib("jspdf.umd.min.js")
         mathjax = self._load_lib("mathjax.js")
 
-        # 如果库文件加载失败，使用CDN备用链接
-        chartjs_tag = f"<script>{chartjs}</script>" if chartjs else '<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>'
-        sankey_tag = f"<script>{chartjs_sankey}</script>" if chartjs_sankey else '<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-sankey@4"></script>'
-        html2canvas_tag = f"<script>{html2canvas}</script>" if html2canvas else '<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>'
-        jspdf_tag = f"<script>{jspdf}</script>" if jspdf else '<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>'
-        mathjax_tag = f"<script defer>{mathjax}</script>" if mathjax else '<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>'
+        # 生成嵌入式script标签，并为每个库添加CDN fallback机制
+        # Chart.js - 主要图表库
+        chartjs_tag = self._build_script_with_fallback(
+            inline_code=chartjs,
+            cdn_url="https://cdn.jsdelivr.net/npm/chart.js",
+            check_expression="typeof Chart !== 'undefined'",
+            lib_name="Chart.js"
+        )
+
+        # Chart.js Sankey插件
+        sankey_tag = self._build_script_with_fallback(
+            inline_code=chartjs_sankey,
+            cdn_url="https://cdn.jsdelivr.net/npm/chartjs-chart-sankey@4",
+            check_expression="typeof Chart !== 'undefined' && Chart.controllers && Chart.controllers.sankey",
+            lib_name="chartjs-chart-sankey"
+        )
+
+        # html2canvas - 用于截图
+        html2canvas_tag = self._build_script_with_fallback(
+            inline_code=html2canvas,
+            cdn_url="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js",
+            check_expression="typeof html2canvas !== 'undefined'",
+            lib_name="html2canvas"
+        )
+
+        # jsPDF - 用于PDF导出
+        jspdf_tag = self._build_script_with_fallback(
+            inline_code=jspdf,
+            cdn_url="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js",
+            check_expression="typeof jspdf !== 'undefined'",
+            lib_name="jsPDF"
+        )
+
+        # MathJax - 数学公式渲染
+        mathjax_tag = self._build_script_with_fallback(
+            inline_code=mathjax,
+            cdn_url="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js",
+            check_expression="typeof MathJax !== 'undefined'",
+            lib_name="MathJax",
+            is_defer=True
+        )
+
+        # PDF字体数据不再嵌入HTML，减小文件体积
+        pdf_font_script = ""
 
         return f"""
 <head>
@@ -284,13 +398,10 @@ class HTMLRenderer:
     }};
   </script>
   {mathjax_tag}
+  {pdf_font_script}
   <style>
 {css}
   </style>
-  <script>
-    // 预载 PDF 字体 Base64 数据，后续由 jspdf addFileToVFS 使用
-    window.pdfFontData = {pdf_font_literal};
-  </script>
   <script>
     document.documentElement.classList.remove('no-js');
     document.documentElement.classList.add('js-ready');
@@ -300,12 +411,13 @@ class HTMLRenderer:
     def _render_body(self) -> str:
         """
         拼装<body>结构，包含头部、导航、章节和脚本。
+        新版本：移除独立的cover section，标题合并到hero section中。
 
         返回:
             str: body片段HTML。
         """
         header = self._render_header()
-        cover = self._render_cover()
+        # cover = self._render_cover()  # 不再单独渲染cover
         hero = self._render_hero()
         toc_section = self._render_toc_section()
         chapters = "".join(self._render_chapter(chapter) for chapter in self.chapters)
@@ -328,7 +440,6 @@ class HTMLRenderer:
 {header}
 {overlay}
 <main>
-{cover}
 {hero}
 {toc_section}
 {chapters}
@@ -359,7 +470,7 @@ class HTMLRenderer:
   <div class="header-actions">
     <button id="theme-toggle" class="action-btn" type="button">🌗 主题切换</button>
     <button id="print-btn" class="action-btn" type="button">🖨️ 打印</button>
-    <button id="export-btn" class="action-btn" type="button">⬇️ 导出PDF</button>
+    <button id="export-btn" class="action-btn" type="button" style="display: none;">⬇️ 导出PDF</button>
   </div>
 </header>
 """.strip()
@@ -397,6 +508,7 @@ class HTMLRenderer:
     def _render_hero(self) -> str:
         """
         根据layout中的hero字段输出摘要/KPI/亮点区。
+        新版本：将标题和总览合并在一起，去掉椭圆背景。
 
         返回:
             str: hero区HTML，若无数据则为空字符串。
@@ -404,6 +516,11 @@ class HTMLRenderer:
         hero = self.metadata.get("hero") or {}
         if not hero:
             return ""
+
+        # 获取标题和副标题
+        title = self.metadata.get("title") or "智能舆情报告"
+        subtitle = self.metadata.get("subtitle") or self.metadata.get("templateName") or ""
+
         summary = hero.get("summary")
         summary_html = f'<p class="hero-summary">{self._escape_html(summary)}</p>' if summary else ""
         highlights = hero.get("highlights") or []
@@ -430,14 +547,21 @@ class HTMLRenderer:
             """
 
         return f"""
-<section class="hero-section">
-  <div class="hero-content">
-    {summary_html}
-    <ul class="hero-highlights">{highlight_html}</ul>
-    <div class="hero-actions">{actions_html}</div>
+<section class="hero-section-combined">
+  <div class="hero-header">
+    <p class="hero-hint">文章总览</p>
+    <h1 class="hero-title">{self._escape_html(title)}</h1>
+    <p class="hero-subtitle">{self._escape_html(subtitle)}</p>
   </div>
-  <div class="hero-side">
-    {kpi_cards}
+  <div class="hero-body">
+    <div class="hero-content">
+      {summary_html}
+      <ul class="hero-highlights">{highlight_html}</ul>
+      <div class="hero-actions">{actions_html}</div>
+    </div>
+    <div class="hero-side">
+      {kpi_cards}
+    </div>
   </div>
 </section>
 """.strip()
@@ -844,7 +968,12 @@ class HTMLRenderer:
             str: section包裹的HTML。
         """
         section_id = self._escape_attr(chapter.get("anchor") or f"chapter-{chapter.get('chapterId', 'x')}")
-        blocks_html = self._render_blocks(chapter.get("blocks", []))
+        prev_chapter = self._current_chapter
+        self._current_chapter = chapter
+        try:
+            blocks_html = self._render_blocks(chapter.get("blocks", []))
+        finally:
+            self._current_chapter = prev_chapter
         return f'<section id="{section_id}" class="chapter">\n{blocks_html}\n</section>'
 
     def _render_blocks(self, blocks: List[Dict[str, Any]]) -> str:
@@ -889,6 +1018,14 @@ class HTMLRenderer:
         if handler:
             html_fragment = handler(block)
             return self._wrap_error_block(html_fragment, block)
+        # 兼容旧格式：缺少type但包含inlines时按paragraph处理
+        if isinstance(block, dict) and block.get("inlines"):
+            html_fragment = self._render_paragraph({"inlines": block.get("inlines")})
+            return self._wrap_error_block(html_fragment, block)
+        # 兼容直接传入字符串的场景
+        if isinstance(block, str):
+            html_fragment = self._render_paragraph({"inlines": [{"text": block}]})
+            return self._wrap_error_block(html_fragment, {"meta": {}, "type": "paragraph"})
         if isinstance(block.get("blocks"), list):
             html_fragment = self._render_blocks(block["blocks"])
             return self._wrap_error_block(html_fragment, block)
@@ -1275,6 +1412,98 @@ class HTMLRenderer:
 
         return props, normalized_data
 
+    @staticmethod
+    def _is_chart_data_empty(data: Dict[str, Any] | None) -> bool:
+        """检查图表数据是否为空或缺少有效datasets"""
+        if not isinstance(data, dict):
+            return True
+
+        datasets = data.get("datasets")
+        if not isinstance(datasets, list) or len(datasets) == 0:
+            return True
+
+        for ds in datasets:
+            if not isinstance(ds, dict):
+                continue
+            series = ds.get("data")
+            if isinstance(series, list) and len(series) > 0:
+                return False
+
+        return True
+
+    def _normalize_chart_block(
+        self,
+        block: Dict[str, Any],
+        chapter_context: Dict[str, Any] | None = None,
+    ) -> None:
+        """
+        补全图表block中的缺失字段（如scales、datasets），提升容错性。
+
+        - 将错误挂在block顶层的scales合并进props.options。
+        - 当data缺失或datasets为空时，尝试使用章节级的data作为兜底。
+        """
+
+        if not isinstance(block, dict):
+            return
+
+        if block.get("type") != "widget":
+            return
+
+        widget_type = block.get("widgetType", "")
+        if not (isinstance(widget_type, str) and widget_type.startswith("chart.js")):
+            return
+
+        # 确保props存在
+        props = block.get("props")
+        if not isinstance(props, dict):
+            block["props"] = {}
+            props = block["props"]
+
+        # 将顶层scales合并进options，避免配置丢失
+        scales = block.get("scales")
+        if isinstance(scales, dict):
+            options = props.get("options") if isinstance(props.get("options"), dict) else {}
+            props["options"] = self._merge_dicts(options, {"scales": scales})
+
+        # 确保data存在
+        data = block.get("data")
+        if not isinstance(data, dict):
+            data = {}
+            block["data"] = data
+
+        # 如果datasets为空，尝试使用章节级data填充
+        if chapter_context and self._is_chart_data_empty(data):
+            chapter_data = chapter_context.get("data") if isinstance(chapter_context, dict) else None
+            if isinstance(chapter_data, dict):
+                fallback_ds = chapter_data.get("datasets")
+                if isinstance(fallback_ds, list) and len(fallback_ds) > 0:
+                    merged_data = copy.deepcopy(data)
+                    merged_data["datasets"] = copy.deepcopy(fallback_ds)
+
+                    if not merged_data.get("labels") and isinstance(chapter_data.get("labels"), list):
+                        merged_data["labels"] = copy.deepcopy(chapter_data["labels"])
+
+                    block["data"] = merged_data
+
+        # 若仍缺少labels且数据点包含x值，自动生成便于fallback和坐标刻度
+        data_ref = block.get("data")
+        if isinstance(data_ref, dict) and not data_ref.get("labels"):
+            datasets_ref = data_ref.get("datasets")
+            if isinstance(datasets_ref, list) and datasets_ref:
+                first_ds = datasets_ref[0]
+                ds_data = first_ds.get("data") if isinstance(first_ds, dict) else None
+                if isinstance(ds_data, list):
+                    labels_from_data = []
+                    for idx, point in enumerate(ds_data):
+                        if isinstance(point, dict):
+                            label_text = point.get("x") or point.get("label") or f"点{idx + 1}"
+                        else:
+                            label_text = f"点{idx + 1}"
+                        labels_from_data.append(str(label_text))
+
+                    if labels_from_data:
+                        data_ref["labels"] = labels_from_data
+
     def _render_widget(self, block: Dict[str, Any]) -> str:
         """
         渲染Chart.js等交互组件的占位容器，并记录配置JSON。
@@ -1291,6 +1520,9 @@ class HTMLRenderer:
         返回:
             str: 含canvas与配置脚本的HTML。
         """
+        # 先在block层面做一次容错补全（scales、章节级数据等）
+        self._normalize_chart_block(block, getattr(self, "_current_chapter", None))
+
         # 统计
         widget_type = block.get('widgetType', '')
         is_chart = isinstance(widget_type, str) and widget_type.startswith('chart.js')
@@ -1358,7 +1590,7 @@ class HTMLRenderer:
 
         title = props.get("title")
         title_html = f'<div class="chart-title">{self._escape_html(title)}</div>' if title else ""
-        fallback_html = self._render_widget_fallback(normalized_data)
+        fallback_html = self._render_widget_fallback(normalized_data, block.get("widgetId"))
         return f"""
         <div class="chart-card">
           {title_html}
@@ -1369,7 +1601,7 @@ class HTMLRenderer:
         </div>
         """
 
-    def _render_widget_fallback(self, data: Dict[str, Any]) -> str:
+    def _render_widget_fallback(self, data: Dict[str, Any], widget_id: str | None = None) -> str:
         """渲染图表数据的文本兜底视图，避免Chart.js加载失败时出现空白"""
         if not isinstance(data, dict):
             return ""
@@ -1377,6 +1609,8 @@ class HTMLRenderer:
         datasets = data.get("datasets") or []
         if not labels or not datasets:
             return ""
+
+        widget_attr = f' data-widget-id="{self._escape_attr(widget_id)}"' if widget_id else ""
         header_cells = "".join(
             f"<th>{self._escape_html(ds.get('label') or f'系列{idx + 1}')}</th>"
             for idx, ds in enumerate(datasets)
@@ -1390,7 +1624,7 @@ class HTMLRenderer:
                 row_cells.append(f"<td>{self._escape_html(value)}</td>")
             body_rows += f"<tr>{''.join(row_cells)}</tr>"
         table_html = f"""
-        <div class="chart-fallback" data-prebuilt="true">
+        <div class="chart-fallback" data-prebuilt="true"{widget_attr}>
           <table>
             <thead>
               <tr><th>类别</th>{header_cells}</tr>
@@ -2351,6 +2585,7 @@ pre.code-block {{
   main {{
     box-shadow: none;
     margin: 0;
+    max-width: 100%;
   }}
   .chapter > *,
   .hero-section,
@@ -2362,6 +2597,7 @@ figure,
 blockquote {{
   break-inside: avoid;
   page-break-inside: avoid;
+  max-width: 100%;
 }}
 .chapter h2,
 .chapter h3,
@@ -2373,18 +2609,37 @@ blockquote {{
 .chart-card,
 .table-wrap {{
   overflow: visible !important;
+  max-width: 100% !important;
+  box-sizing: border-box;
 }}
 .chart-card canvas {{
   width: 100% !important;
   height: auto !important;
+  max-width: 100% !important;
+}}
+.table-wrap {{
+  overflow-x: auto;
+  max-width: 100%;
 }}
 .table-wrap table {{
   table-layout: fixed;
   width: 100%;
+  max-width: 100%;
 }}
 .table-wrap table th,
 .table-wrap table td {{
   word-break: break-word;
+  overflow-wrap: break-word;
+}}
+/* 防止图片和图表溢出 */
+img, canvas, svg {{
+  max-width: 100% !important;
+  height: auto !important;
+}}
+/* 确保所有容器不超出页面宽度 */
+* {{
+  box-sizing: border-box;
+  max-width: 100%;
 }}
 }}
 """
@@ -2406,6 +2661,190 @@ const CHART_TYPE_LABELS = {
   radar: '雷达图',
   polarArea: '极地区域图'
 };
+
+// 与PDF矢量渲染保持一致的颜色替换/提亮规则
+const DEFAULT_CHART_COLORS = [
+  '#4A90E2', '#E85D75', '#50C878', '#FFB347',
+  '#9B59B6', '#3498DB', '#E67E22', '#16A085',
+  '#F39C12', '#D35400', '#27AE60', '#8E44AD'
+];
+const CSS_VAR_COLOR_MAP = {
+  'var(--color-accent)': '#4A90E2',
+  'var(--re-accent-color)': '#4A90E2',
+  'var(--re-accent-color-translucent)': 'rgba(74, 144, 226, 0.08)',
+  'var(--color-kpi-down)': '#E85D75',
+  'var(--re-danger-color)': '#E85D75',
+  'var(--re-danger-color-translucent)': 'rgba(232, 93, 117, 0.08)',
+  'var(--color-warning)': '#FFB347',
+  'var(--re-warning-color)': '#FFB347',
+  'var(--re-warning-color-translucent)': 'rgba(255, 179, 71, 0.08)',
+  'var(--color-success)': '#50C878',
+  'var(--re-success-color)': '#50C878',
+  'var(--re-success-color-translucent)': 'rgba(80, 200, 120, 0.08)',
+  'var(--color-primary)': '#3498DB',
+  'var(--color-secondary)': '#95A5A6'
+};
+
+function normalizeColorToken(color) {
+  if (typeof color !== 'string') return color;
+  const trimmed = color.trim();
+  if (!trimmed) return null;
+  if (CSS_VAR_COLOR_MAP[trimmed]) {
+    return CSS_VAR_COLOR_MAP[trimmed];
+  }
+  if (trimmed.startsWith('var(')) {
+    if (/accent|primary/i.test(trimmed)) return '#4A90E2';
+    if (/danger|down|error/i.test(trimmed)) return '#E85D75';
+    if (/warning/i.test(trimmed)) return '#FFB347';
+    if (/success|up/i.test(trimmed)) return '#50C878';
+    return '#3498DB';
+  }
+  return trimmed;
+}
+
+function hexToRgb(color) {
+  if (typeof color !== 'string') return null;
+  const normalized = color.replace('#', '');
+  if (!(normalized.length === 3 || normalized.length === 6)) return null;
+  const hex = normalized.length === 3 ? normalized.split('').map(c => c + c).join('') : normalized;
+  const intVal = parseInt(hex, 16);
+  if (Number.isNaN(intVal)) return null;
+  return [(intVal >> 16) & 255, (intVal >> 8) & 255, intVal & 255];
+}
+
+function parseRgbString(color) {
+  if (typeof color !== 'string') return null;
+  const match = color.match(/rgba?\s*\(([^)]+)\)/i);
+  if (!match) return null;
+  const parts = match[1].split(',').map(p => parseFloat(p.trim())).filter(v => !Number.isNaN(v));
+  if (parts.length < 3) return null;
+  return [parts[0], parts[1], parts[2]].map(v => Math.max(0, Math.min(255, v)));
+}
+
+function rgbFromColor(color) {
+  const normalized = normalizeColorToken(color);
+  return hexToRgb(normalized) || parseRgbString(normalized);
+}
+
+function colorLuminance(color) {
+  const rgb = rgbFromColor(color);
+  if (!rgb) return null;
+  const [r, g, b] = rgb.map(v => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function lightenColor(color, ratio) {
+  const rgb = rgbFromColor(color);
+  if (!rgb) return color;
+  const factor = Math.min(1, Math.max(0, ratio || 0.25));
+  const mixed = rgb.map(v => Math.round(v + (255 - v) * factor));
+  return `rgb(${mixed[0]}, ${mixed[1]}, ${mixed[2]})`;
+}
+
+function ensureAlpha(color, alpha) {
+  const rgb = rgbFromColor(color);
+  if (!rgb) return color;
+  const clamped = Math.min(1, Math.max(0, alpha));
+  return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${clamped})`;
+}
+
+function liftDarkColor(color) {
+  const normalized = normalizeColorToken(color);
+  const lum = colorLuminance(normalized);
+  if (lum !== null && lum < 0.12) {
+    return lightenColor(normalized, 0.35);
+  }
+  return normalized;
+}
+
+function normalizeDatasetColors(payload, chartType) {
+  const changes = [];
+  const data = payload && payload.data;
+  if (!data || !Array.isArray(data.datasets)) {
+    return changes;
+  }
+  const type = chartType || 'bar';
+  const needsArrayColors = type === 'pie' || type === 'doughnut' || type === 'polarArea';
+
+  data.datasets.forEach((dataset, idx) => {
+    if (!isPlainObject(dataset)) return;
+    const paletteColor = normalizeColorToken(DEFAULT_CHART_COLORS[idx % DEFAULT_CHART_COLORS.length]);
+    const baseCandidate = Array.isArray(dataset.borderColor)
+      ? dataset.borderColor[0]
+      : dataset.borderColor || dataset.backgroundColor || dataset.color || paletteColor;
+    const liftedBase = liftDarkColor(baseCandidate || paletteColor);
+
+    if (needsArrayColors) {
+      const labelCount = Array.isArray(data.labels) ? data.labels.length : 0;
+      const rawColors = Array.isArray(dataset.backgroundColor) ? dataset.backgroundColor : [];
+      const dataLength = Array.isArray(dataset.data) ? dataset.data.length : 0;
+      const total = Math.max(labelCount, rawColors.length, dataLength, 1);
+      const normalizedColors = [];
+      for (let i = 0; i < total; i++) {
+        const fallbackColor = DEFAULT_CHART_COLORS[(idx + i) % DEFAULT_CHART_COLORS.length];
+        const normalizedColor = liftDarkColor(rawColors[i] || fallbackColor);
+        normalizedColors.push(normalizedColor);
+      }
+      dataset.backgroundColor = normalizedColors;
+      changes.push(`dataset${idx}: 标准化扇区颜色(${normalizedColors.length})`);
+      return;
+    }
+
+    const borderIsArray = Array.isArray(dataset.borderColor);
+    if (!dataset.borderColor) {
+      dataset.borderColor = liftedBase;
+      changes.push(`dataset${idx}: 补全边框色`);
+    } else if (borderIsArray) {
+      dataset.borderColor = dataset.borderColor.map(col => liftDarkColor(col));
+    } else {
+      dataset.borderColor = liftDarkColor(dataset.borderColor);
+    }
+
+    const bgIsArray = Array.isArray(dataset.backgroundColor);
+    if (bgIsArray) {
+      dataset.backgroundColor = dataset.backgroundColor.map(col => liftDarkColor(col));
+    }
+
+    const typeAlpha = type === 'line'
+      ? (dataset.fill ? 0.08 : 0.12)
+      : type === 'radar'
+        ? 0.25
+        : type === 'scatter' || type === 'bubble'
+          ? 0.6
+          : type === 'bar'
+            ? 0.85
+            : null;
+
+    if (typeAlpha !== null) {
+      if (bgIsArray && dataset.backgroundColor.length) {
+        dataset.backgroundColor = dataset.backgroundColor.map(col => ensureAlpha(col, typeAlpha));
+      } else {
+        dataset.backgroundColor = ensureAlpha(liftedBase, typeAlpha);
+      }
+      if (dataset.fill || type !== 'line') {
+        changes.push(`dataset${idx}: 应用淡化填充以避免遮挡`);
+      }
+    } else if (!dataset.backgroundColor) {
+      dataset.backgroundColor = ensureAlpha(liftedBase, 0.85);
+    } else if (!bgIsArray) {
+      dataset.backgroundColor = liftDarkColor(dataset.backgroundColor);
+    }
+
+    if (type === 'line' && !dataset.pointBackgroundColor) {
+      dataset.pointBackgroundColor = Array.isArray(dataset.borderColor)
+        ? dataset.borderColor[0]
+        : dataset.borderColor;
+    }
+  });
+
+  if (changes.length) {
+    payload._colorAudit = changes;
+  }
+  return changes;
+}
 
 function getThemePalette() {
   const styles = getComputedStyle(document.body);
@@ -2754,13 +3193,17 @@ function hydrateCharts() {
 
     // 前端数据验证
     const desiredType = chartTypes[0];
+    const card = canvas.closest('.chart-card') || canvas.parentElement;
+    const colorAdjustments = normalizeDatasetColors(payload, desiredType);
+    if (colorAdjustments.length && card) {
+      card.setAttribute('data-chart-color-fixes', colorAdjustments.join(' | '));
+    }
     const validation = validateChartData(payload, desiredType);
     if (!validation.valid) {
       console.warn('图表数据验证失败:', validation.errors);
       // 验证失败但仍然尝试渲染，因为可能会降级成功
     }
 
-    const card = canvas.closest('.chart-card') || canvas.parentElement;
     const optionsTemplate = buildChartOptions(payload);
     let chartInstance = null;
     let selectedType = null;
@@ -2837,6 +3280,7 @@ function hideExportOverlay(delay) {
   }
 }
 
+// exportPdf已移除
 function exportPdf() {
   const target = document.querySelector('main');
   if (!target || typeof jspdf === 'undefined' || typeof jspdf.jsPDF !== 'function') {
@@ -2852,9 +3296,12 @@ function exportPdf() {
   const pdf = new jspdf.jsPDF('p', 'mm', 'a4');
   try {
     if (window.pdfFontData) {
-      pdf.addFileToVFS('SourceHanSerifSC-Medium.otf', window.pdfFontData);
-      pdf.addFont('SourceHanSerifSC-Medium.otf', 'SourceHanSerif', 'normal');
+      pdf.addFileToVFS('SourceHanSerifSC-Medium.ttf', window.pdfFontData);
+      pdf.addFont('SourceHanSerifSC-Medium.ttf', 'SourceHanSerif', 'normal');
       pdf.setFont('SourceHanSerif');
+      console.log('PDF字体已成功加载');
+    } else {
+      console.warn('PDF字体数据未找到，将使用默认字体');
     }
   } catch (err) {
     console.warn('Custom PDF font setup failed, fallback to default', err);
@@ -2887,11 +3334,13 @@ function exportPdf() {
       autoPaging: 'text',
       windowWidth: pxWidth,
       html2canvas: {
-        scale: Math.min(1.2, Math.max(0.8, pageWidth / (target.clientWidth || pageWidth))),
+        scale: Math.min(1.5, Math.max(1.0, pageWidth / (target.clientWidth || pageWidth))),
         useCORS: true,
         scrollX: 0,
         scrollY: -window.scrollY,
-        logging: false
+        logging: false,
+        allowTaint: true,
+        backgroundColor: '#ffffff'
       },
       pagebreak: {
         mode: ['css', 'legacy'],
