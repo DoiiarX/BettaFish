@@ -329,6 +329,7 @@ class HTMLRenderer:
         html2canvas = self._load_lib("html2canvas.min.js")
         jspdf = self._load_lib("jspdf.umd.min.js")
         mathjax = self._load_lib("mathjax.js")
+        wordcloud2 = self._load_lib("wordcloud2.min.js")
 
         # 生成嵌入式script标签，并为每个库添加CDN fallback机制
         # Chart.js - 主要图表库
@@ -345,6 +346,14 @@ class HTMLRenderer:
             cdn_url="https://cdn.jsdelivr.net/npm/chartjs-chart-sankey@4",
             check_expression="typeof Chart !== 'undefined' && Chart.controllers && Chart.controllers.sankey",
             lib_name="chartjs-chart-sankey"
+        )
+
+        # wordcloud2 - 词云渲染
+        wordcloud_tag = self._build_script_with_fallback(
+            inline_code=wordcloud2,
+            cdn_url="https://cdnjs.cloudflare.com/ajax/libs/wordcloud2.js/1.2.2/wordcloud2.min.js",
+            check_expression="typeof WordCloud !== 'undefined'",
+            lib_name="wordcloud2"
         )
 
         # html2canvas - 用于截图
@@ -383,6 +392,7 @@ class HTMLRenderer:
   <title>{self._escape_html(title)}</title>
   {chartjs_tag}
   {sankey_tag}
+  {wordcloud_tag}
   {html2canvas_tag}
   {jspdf_tag}
   <script>
@@ -1526,6 +1536,7 @@ class HTMLRenderer:
         # 统计
         widget_type = block.get('widgetType', '')
         is_chart = isinstance(widget_type, str) and widget_type.startswith('chart.js')
+        is_wordcloud = isinstance(widget_type, str) and 'wordcloud' in widget_type.lower()
 
         if is_chart:
             self.chart_validation_stats['total'] += 1
@@ -1590,9 +1601,13 @@ class HTMLRenderer:
 
         title = props.get("title")
         title_html = f'<div class="chart-title">{self._escape_html(title)}</div>' if title else ""
-        fallback_html = self._render_widget_fallback(normalized_data, block.get("widgetId"))
+        fallback_html = (
+            self._render_wordcloud_fallback(props, block.get("widgetId"))
+            if is_wordcloud
+            else self._render_widget_fallback(normalized_data, block.get("widgetId"))
+        )
         return f"""
-        <div class="chart-card">
+        <div class="chart-card{' wordcloud-card' if is_wordcloud else ''}">
           {title_html}
           <div class="chart-container">
             <canvas id="{canvas_id}" data-config-id="{config_id}"></canvas>
@@ -1636,6 +1651,51 @@ class HTMLRenderer:
         </div>
         """
         return table_html
+
+    def _render_wordcloud_fallback(self, props: Dict[str, Any] | None, widget_id: str | None = None) -> str:
+        """为词云提供表格兜底，避免WordCloud渲染失败后页面空白"""
+        words = []
+        if isinstance(props, dict):
+            raw = props.get("data")
+            if isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("word") or item.get("text") or item.get("label")
+                    weight = item.get("weight")
+                    category = item.get("category") or ""
+                    if text:
+                        words.append({"word": str(text), "weight": weight, "category": str(category)})
+
+        if not words:
+            return ""
+
+        def _format_weight(value: Any) -> str:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if 0 <= value <= 1.5:
+                    return f"{value * 100:.1f}%"
+                return f"{value:.2f}".rstrip("0").rstrip(".")
+            return str(value)
+
+        widget_attr = f' data-widget-id="{self._escape_attr(widget_id)}"' if widget_id else ""
+        rows = "".join(
+            f"<tr><td>{self._escape_html(item['word'])}</td>"
+            f"<td>{self._escape_html(_format_weight(item['weight']))}</td>"
+            f"<td>{self._escape_html(item['category'] or '-')}</td></tr>"
+            for item in words
+        )
+        return f"""
+        <div class="chart-fallback" data-prebuilt="true"{widget_attr}>
+          <table>
+            <thead>
+              <tr><th>关键词</th><th>权重</th><th>类别</th></tr>
+            </thead>
+            <tbody>
+              {rows}
+            </tbody>
+          </table>
+        </div>
+        """
 
     def _log_chart_validation_stats(self):
         """输出图表验证统计信息"""
@@ -2498,6 +2558,9 @@ table th {{
   border-radius: 12px;
   background: rgba(0,0,0,0.01);
 }}
+.chart-card.wordcloud-card .chart-container {{
+  min-height: 260px;
+}}
 .chart-container {{
   position: relative;
   min-height: 320px;
@@ -2652,6 +2715,7 @@ document.documentElement.classList.remove('no-js');
 document.documentElement.classList.add('js-ready');
 
 const chartRegistry = [];
+const wordCloudRegistry = new Map();
 const STABLE_CHART_TYPES = ['line', 'bar'];
 const CHART_TYPE_LABELS = {
   line: '折线图',
@@ -2669,6 +2733,9 @@ const DEFAULT_CHART_COLORS = [
   '#F39C12', '#D35400', '#27AE60', '#8E44AD'
 ];
 const CSS_VAR_COLOR_MAP = {
+  'var(--chart-color-green)': '#4BC0C0',
+  'var(--chart-color-red)': '#FF6384',
+  'var(--chart-color-blue)': '#36A2EB',
   'var(--color-accent)': '#4A90E2',
   'var(--re-accent-color)': '#4A90E2',
   'var(--re-accent-color-translucent)': 'rgba(74, 144, 226, 0.08)',
@@ -2683,6 +2750,12 @@ const CSS_VAR_COLOR_MAP = {
   'var(--re-success-color-translucent)': 'rgba(80, 200, 120, 0.08)',
   'var(--color-primary)': '#3498DB',
   'var(--color-secondary)': '#95A5A6'
+};
+const WORDCLOUD_CATEGORY_COLORS = {
+  positive: '#10b981',
+  negative: '#ef4444',
+  neutral: '#6b7280',
+  controversial: '#f59e0b'
 };
 
 function normalizeColorToken(color) {
@@ -2768,18 +2841,24 @@ function normalizeDatasetColors(payload, chartType) {
   }
   const type = chartType || 'bar';
   const needsArrayColors = type === 'pie' || type === 'doughnut' || type === 'polarArea';
+  const pickColor = (value, fallback) => {
+    if (Array.isArray(value) && value.length) return value[0];
+    return value || fallback;
+  };
 
   data.datasets.forEach((dataset, idx) => {
     if (!isPlainObject(dataset)) return;
     const paletteColor = normalizeColorToken(DEFAULT_CHART_COLORS[idx % DEFAULT_CHART_COLORS.length]);
-    const baseCandidate = Array.isArray(dataset.borderColor)
-      ? dataset.borderColor[0]
-      : dataset.borderColor || dataset.backgroundColor || dataset.color || paletteColor;
+    const borderInput = dataset.borderColor;
+    const backgroundInput = dataset.backgroundColor;
+    const borderIsArray = Array.isArray(borderInput);
+    const bgIsArray = Array.isArray(backgroundInput);
+    const baseCandidate = pickColor(borderInput, pickColor(backgroundInput, dataset.color || paletteColor));
     const liftedBase = liftDarkColor(baseCandidate || paletteColor);
 
     if (needsArrayColors) {
       const labelCount = Array.isArray(data.labels) ? data.labels.length : 0;
-      const rawColors = Array.isArray(dataset.backgroundColor) ? dataset.backgroundColor : [];
+      const rawColors = bgIsArray ? backgroundInput : [];
       const dataLength = Array.isArray(dataset.data) ? dataset.data.length : 0;
       const total = Math.max(labelCount, rawColors.length, dataLength, 1);
       const normalizedColors = [];
@@ -2793,19 +2872,13 @@ function normalizeDatasetColors(payload, chartType) {
       return;
     }
 
-    const borderIsArray = Array.isArray(dataset.borderColor);
-    if (!dataset.borderColor) {
+    if (!borderInput) {
       dataset.borderColor = liftedBase;
       changes.push(`dataset${idx}: 补全边框色`);
     } else if (borderIsArray) {
-      dataset.borderColor = dataset.borderColor.map(col => liftDarkColor(col));
+      dataset.borderColor = borderInput.map(col => liftDarkColor(col));
     } else {
-      dataset.borderColor = liftDarkColor(dataset.borderColor);
-    }
-
-    const bgIsArray = Array.isArray(dataset.backgroundColor);
-    if (bgIsArray) {
-      dataset.backgroundColor = dataset.backgroundColor.map(col => liftDarkColor(col));
+      dataset.borderColor = liftDarkColor(borderInput);
     }
 
     const typeAlpha = type === 'line'
@@ -2820,15 +2893,18 @@ function normalizeDatasetColors(payload, chartType) {
 
     if (typeAlpha !== null) {
       if (bgIsArray && dataset.backgroundColor.length) {
-        dataset.backgroundColor = dataset.backgroundColor.map(col => ensureAlpha(col, typeAlpha));
+        dataset.backgroundColor = backgroundInput.map(col => ensureAlpha(liftDarkColor(col), typeAlpha));
       } else {
-        dataset.backgroundColor = ensureAlpha(liftedBase, typeAlpha);
+        const bgSeed = pickColor(backgroundInput, pickColor(dataset.borderColor, paletteColor));
+        dataset.backgroundColor = ensureAlpha(liftDarkColor(bgSeed), typeAlpha);
       }
       if (dataset.fill || type !== 'line') {
         changes.push(`dataset${idx}: 应用淡化填充以避免遮挡`);
       }
     } else if (!dataset.backgroundColor) {
       dataset.backgroundColor = ensureAlpha(liftedBase, 0.85);
+    } else if (bgIsArray) {
+      dataset.backgroundColor = backgroundInput.map(col => liftDarkColor(col));
     } else if (!bgIsArray) {
       dataset.backgroundColor = liftDarkColor(dataset.backgroundColor);
     }
@@ -2936,6 +3012,170 @@ function clearChartDegradeNote(card) {
   const note = card.querySelector('.chart-note');
   if (note) {
     note.remove();
+  }
+}
+
+function isWordCloudWidget(payload) {
+  const type = payload && payload.widgetType;
+  return typeof type === 'string' && type.toLowerCase().includes('wordcloud');
+}
+
+function normalizeWordcloudItems(payload) {
+  const source = payload && payload.props && payload.props.data;
+  if (!Array.isArray(source)) return [];
+  return source.map(item => {
+    if (!item || typeof item !== 'object') return null;
+    const word = item.word || item.text || item.label;
+    if (!word) return null;
+    const rawWeight = item.weight;
+    let weight = 0;
+    if (typeof rawWeight === 'number' && !Number.isNaN(rawWeight)) {
+      weight = rawWeight;
+    } else if (typeof rawWeight === 'string') {
+      const parsed = parseFloat(rawWeight);
+      weight = Number.isNaN(parsed) ? 0 : parsed;
+    }
+    const category = (item.category || '').toString().toLowerCase();
+    return { word: String(word), weight, category };
+  }).filter(Boolean);
+}
+
+function wordcloudColor(category) {
+  const key = typeof category === 'string' ? category.toLowerCase() : '';
+  return WORDCLOUD_CATEGORY_COLORS[key] || '#334155';
+}
+
+function renderWordCloudFallback(canvas, items, reason) {
+  const card = canvas.closest('.chart-card') || canvas.parentElement;
+  if (!card) return;
+  const wrapper = canvas.parentElement && canvas.parentElement.classList && canvas.parentElement.classList.contains('chart-container')
+    ? canvas.parentElement
+    : null;
+  if (wrapper) {
+    wrapper.style.display = 'none';
+  } else {
+    canvas.style.display = 'none';
+  }
+  let fallback = card.querySelector('.chart-fallback');
+  if (!fallback) {
+    fallback = document.createElement('div');
+    fallback.className = 'chart-fallback wordcloud-fallback';
+    fallback.setAttribute('data-dynamic', 'true');
+    card.appendChild(fallback);
+  }
+  fallback.style.display = 'block';
+  card.setAttribute('data-chart-state', 'fallback');
+  if (reason) {
+    let notice = fallback.querySelector('.chart-fallback__notice');
+    if (!notice) {
+      notice = document.createElement('p');
+      notice.className = 'chart-fallback__notice';
+      fallback.insertBefore(notice, fallback.firstChild || null);
+    }
+    notice.textContent = `词云未能渲染${reason ? `（${reason}）` : ''}，已展示数据表。`;
+  }
+  if (fallback.querySelector('table')) {
+    return;
+  }
+  if (!items || !items.length) {
+    const empty = document.createElement('p');
+    empty.textContent = '暂无可用数据。';
+    fallback.appendChild(empty);
+    return;
+  }
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  ['关键词', '权重', '类别'].forEach(text => {
+    const th = document.createElement('th');
+    th.textContent = text;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  items.forEach(item => {
+    const row = document.createElement('tr');
+    const wordCell = document.createElement('td');
+    wordCell.textContent = item.word;
+    const weightCell = document.createElement('td');
+    if (typeof item.weight === 'number' && !Number.isNaN(item.weight)) {
+      weightCell.textContent = item.weight >= 0 && item.weight <= 1.5
+        ? `${(item.weight * 100).toFixed(1)}%`
+        : item.weight.toFixed(2).replace(/\.0+$/, '').replace(/0+$/, '').replace(/\.$/, '');
+    } else {
+      weightCell.textContent = item.weight !== undefined && item.weight !== null ? String(item.weight) : '—';
+    }
+    const categoryCell = document.createElement('td');
+    categoryCell.textContent = item.category || '—';
+    categoryCell.style.color = wordcloudColor(item.category);
+    row.appendChild(wordCell);
+    row.appendChild(weightCell);
+    row.appendChild(categoryCell);
+    tbody.appendChild(row);
+  });
+  table.appendChild(tbody);
+  fallback.appendChild(table);
+}
+
+function renderWordCloud(canvas, payload, skipRegistry) {
+  const items = normalizeWordcloudItems(payload);
+  const card = canvas.closest('.chart-card') || canvas.parentElement;
+  const container = canvas.parentElement && canvas.parentElement.classList && canvas.parentElement.classList.contains('chart-container')
+    ? canvas.parentElement
+    : null;
+  if (!items.length) {
+    renderWordCloudFallback(canvas, items, '无有效数据');
+    return;
+  }
+  if (typeof WordCloud === 'undefined') {
+    renderWordCloudFallback(canvas, items, '词云依赖未加载');
+    return;
+  }
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const width = Math.max(240, (container ? container.clientWidth : canvas.clientWidth || canvas.width || 320));
+  const height = Math.max(180, Math.round(width * 0.62));
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+
+  const maxWeight = items.reduce((max, item) => Math.max(max, item.weight || 0), 0) || 1;
+  const list = items.map(item => [item.word, item.weight && item.weight > 0 ? item.weight : 1]);
+  try {
+    WordCloud(canvas, {
+      list,
+      gridSize: Math.max(8, Math.floor(Math.sqrt(canvas.width * canvas.height) / 80)),
+      weightFactor: (val) => {
+        const normalized = Math.max(0, val) / maxWeight;
+        const size = 16 + normalized * 32;
+        return size * dpr;
+      },
+      color: (word) => {
+        const found = items.find(entry => entry.word === word);
+        return lightenColor(wordcloudColor(found && found.category), 0.05);
+      },
+      rotateRatio: 0.15,
+      shuffle: false,
+      shrinkToFit: true,
+      drawOutOfBound: false,
+      backgroundColor: getComputedStyle(document.body).getPropertyValue('--card-bg').trim() || '#fff'
+    });
+    if (container) {
+      container.style.display = '';
+      container.style.minHeight = `${height}px`;
+    }
+    const fallback = card && card.querySelector('.chart-fallback');
+    if (fallback) {
+      fallback.style.display = 'none';
+    }
+    card && card.removeAttribute('data-chart-state');
+    if (!skipRegistry) {
+      wordCloudRegistry.set(canvas, () => renderWordCloud(canvas, payload, true));
+    }
+  } catch (err) {
+    console.error('WordCloud 渲染失败', err);
+    renderWordCloudFallback(canvas, items, err && err.message ? err.message : '');
   }
 }
 
@@ -3168,6 +3408,14 @@ function instantiateChart(ctx, payload, optionsTemplate, type) {
   return new Chart(ctx, config);
 }
 
+function debounce(fn, wait) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(null, args), wait || 200);
+  };
+}
+
 function hydrateCharts() {
   document.querySelectorAll('canvas[data-config-id]').forEach(canvas => {
     const configScript = document.getElementById(canvas.dataset.configId);
@@ -3178,6 +3426,10 @@ function hydrateCharts() {
     } catch (err) {
       console.error('Widget JSON 解析失败', err);
       renderChartFallback(canvas, { widgetId: canvas.dataset.configId }, '配置解析失败');
+      return;
+    }
+    if (isWordCloudWidget(payload)) {
+      renderWordCloud(canvas, payload);
       return;
     }
     if (typeof Chart === 'undefined') {
@@ -3326,6 +3578,15 @@ function exportPdf() {
         chart.resize();
       }
     });
+    wordCloudRegistry.forEach(fn => {
+      if (typeof fn === 'function') {
+        try {
+          fn();
+        } catch (err) {
+          console.error('词云重新渲染失败', err);
+        }
+      }
+    });
     renderTask = pdf.html(target, {
       x: 8,
       y: 12,
@@ -3398,6 +3659,14 @@ document.addEventListener('DOMContentLoaded', () => {
   if (exportBtn) {
     exportBtn.addEventListener('click', exportPdf);
   }
+  const rerenderWordclouds = debounce(() => {
+    wordCloudRegistry.forEach(fn => {
+      if (typeof fn === 'function') {
+        fn();
+      }
+    });
+  }, 260);
+  window.addEventListener('resize', rerenderWordclouds);
   hydrateCharts();
 });
 </script>
